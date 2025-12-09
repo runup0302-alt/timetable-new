@@ -153,7 +153,7 @@ def generate_excel(df_res, classes, teacher_data, df_const):
     wb.save(output)
     return output.getvalue()
 
-# ★★★ 精密診断関数 (ここを強化) ★★★
+# ★★★ 精密診断関数 (安全装置追加) ★★★
 def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
     errors = []
     teachers = df_teacher['教員名'].tolist()
@@ -162,11 +162,9 @@ def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
         try: t_grade[r['教員名']] = int(r['担当学年'])
         except: t_grade[r['教員名']] = 0
 
-    # スケジュール埋まり状況
     t_sched = {t: {} for t in teachers}
     days = ['月', '火', '水', '木', '金']
     
-    # 固定リストチェック
     for _, r in df_const.iterrows():
         t_target = r['対象（教員名orクラス）']; d = r['曜日']; p = int(r['限'])
         targets = []
@@ -181,54 +179,49 @@ def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
                 errors.append(f"🔴 ダブルブッキング: {t}先生の {d}曜{p}限 に複数の固定が入っています。")
             t_sched[t][(d, p)] = r['内容']
 
-    # ★学年団ブロックの矛盾チェック★
-    # 総合などが固定されている時間に、その学年の教員が別の固定を持っていないか？
-    subj_block = {}
-    col_block = find_column(df_conf, ['学年団拘束', '学年拘束'])
-    for _, r in df_conf.iterrows():
-        if clean_bool(r[col_block]): subj_block[r['教科']] = True
-        
-    for _, r in df_const.iterrows():
-        t_target = r['対象（教員名orクラス）']
-        content = r['内容']
-        # もし固定されているのが「学年団拘束科目」なら
-        if content in subj_block and t_target not in teachers: # クラス指定の固定と仮定
-            # クラスの学年特定
-            try: 
-                target_grade = int(str(t_target).split('-')[0])
-                d = r['曜日']; p = int(r['限'])
-                
-                # その学年の全教員をチェック
-                for t_name, t_g in t_grade.items():
-                    if t_g == target_grade:
-                        # その先生が、まさにその時間に別の固定を持っていたらNG
-                        if (d, p) in t_sched[t_name]:
-                            # ただし、その固定内容が「まさにその総合」ならOK
-                            if t_sched[t_name][(d, p)] != content:
-                                errors.append(f"🔴 学年団ブロック矛盾: {target_grade}年の「{content}」が {d}曜{p}限 に固定されていますが、{t_name}先生は同じ時間に「{t_sched[t_name][(d, p)]}」が固定されています。")
-            except: pass
+    # 学年団ブロックチェック (列名が見つからなければスキップ)
+    col_block = find_column(df_conf, ['学年団拘束', '学年拘束', '学年団', '拘束'])
+    if col_block:
+        subj_block = {}
+        for _, r in df_conf.iterrows():
+            if clean_bool(r[col_block]): subj_block[r['教科']] = True
+            
+        for _, r in df_const.iterrows():
+            t_target = r['対象（教員名orクラス）']
+            content = r['内容']
+            if content in subj_block and t_target not in teachers:
+                try: 
+                    target_grade = int(str(t_target).split('-')[0])
+                    d = r['曜日']; p = int(r['限'])
+                    for t_name, t_g in t_grade.items():
+                        if t_g == target_grade:
+                            if (d, p) in t_sched[t_name]:
+                                if t_sched[t_name][(d, p)] != content:
+                                    errors.append(f"🔴 学年団ブロック矛盾: {target_grade}年の「{content}」が {d}曜{p}限 に固定されていますが、{t_name}先生は同じ時間に「{t_sched[t_name][(d, p)]}」が固定されています。")
+                except: pass
 
-    # ニコイチ配置可否チェック
-    subj_continuous = {}
-    col_cont = find_column(df_conf, ['連続コマ', '連続'])
-    for _, r in df_conf.iterrows():
-        if clean_bool(r[col_cont]): subj_continuous[r['教科']] = True
+    # ニコイチチェック (列名が見つからなければスキップ)
+    col_cont = find_column(df_conf, ['連続コマ', '連続', '2コマ'])
+    if col_cont:
+        subj_continuous = {}
+        for _, r in df_conf.iterrows():
+            if clean_bool(r[col_cont]): subj_continuous[r['教科']] = True
 
-    for _, r in df_req.iterrows():
-        subj = r['教科']; t1 = r['担当教員']
-        if subj in subj_continuous and pd.notna(t1) and t1 in teachers:
-            has_double_slot = False
-            for d in days:
-                periods = [1,2,3,4,5,6] if d != '金' else [1,2,3,4,5]
-                for i in range(len(periods)-1):
-                    p1 = periods[i]; p2 = periods[i+1]
-                    if p1 == 4 and p2 == 5: continue 
-                    if (d, p1) not in t_sched[t1] and (d, p2) not in t_sched[t1]:
-                        has_double_slot = True
-                        break
-                if has_double_slot: break
-            if not has_double_slot:
-                errors.append(f"🔴 ニコイチ配置不可: {t1}先生の「{subj}」を入れる連続した空き時間がありません。")
+        for _, r in df_req.iterrows():
+            subj = r['教科']; t1 = r['担当教員']
+            if subj in subj_continuous and pd.notna(t1) and t1 in teachers:
+                has_double_slot = False
+                for d in days:
+                    periods = [1,2,3,4,5,6] if d != '金' else [1,2,3,4,5]
+                    for i in range(len(periods)-1):
+                        p1 = periods[i]; p2 = periods[i+1]
+                        if p1 == 4 and p2 == 5: continue 
+                        if (d, p1) not in t_sched[t1] and (d, p2) not in t_sched[t1]:
+                            has_double_slot = True
+                            break
+                    if has_double_slot: break
+                if not has_double_slot:
+                    errors.append(f"🔴 ニコイチ配置不可: {t1}先生の「{subj}」を入れる連続した空き時間がありません。")
     return errors
 
 def check_capacity(df_req, df_teacher, df_const):
@@ -385,7 +378,6 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
                 for d in days:
                     possible_starts = [1, 2, 3, 5] if d != '金' else [1, 2, 3]
                     
-                    # 強制モードなら 4限スタート(昼跨ぎ)も許可
                     if force_mode:
                         possible_starts = [1, 2, 3, 4, 5] if d != '金' else [1, 2, 3, 4]
 
@@ -397,13 +389,6 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
                         start_vars.append(s_var)
                         model.Add(x[(c, d, s, item['id'])] == 1).OnlyEnforceIf(s_var)
                         model.Add(x[(c, d, s+1, item['id'])] == 1).OnlyEnforceIf(s_var)
-                    
-                    # 強制モードなら連続性チェックをスキップ(単純な数あわせにする)
-                    if not force_mode:
-                        # ここは厳密に実装すると複雑なため、今回は「開始フラグが立つこと」を条件にする簡易実装
-                        # (より厳密にするには day_slots の和が 2 * sum(start_vars) になる制約が必要だが、
-                        #  固定リストとの兼ね合いで詰みやすいため、一旦緩和している)
-                        pass
 
     # 個別指示
     if manual_instructions:
@@ -510,7 +495,6 @@ recalc_list = [x.strip() for x in recalc_str.split(',')] if recalc_str else []
 st.title("🏫 中学校時間割 AI作成システム (完全汎用版)")
 
 if f_req and f_teacher and f_const and f_conf:
-    # 読み込み
     df_req = load_csv_safe(f_req)
     df_teacher = load_csv_safe(f_teacher)
     df_const = load_csv_safe(f_const)
@@ -524,7 +508,6 @@ if f_req and f_teacher and f_const and f_conf:
     teachers = df_teacher['教員名'].tolist()
     classes = sorted(df_req['クラス'].unique().tolist())
     
-    # ★ 矛盾診断 (強化) ★
     st.markdown("---")
     st.subheader("🔍 データ矛盾診断")
     
@@ -546,7 +529,6 @@ if f_req and f_teacher and f_const and f_conf:
     
     st.markdown("---")
 
-    # 個別指示
     st.markdown("### 🗣️ 個別指示機能")
     if 'instructions' not in st.session_state:
         st.session_state['instructions'] = pd.DataFrame(columns=['対象', '曜日', '教科', '指示タイプ', '値'])
