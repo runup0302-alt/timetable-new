@@ -29,54 +29,47 @@ st.set_page_config(layout="wide", page_title="中学校時間割システム")
 if "PASSWORD" in st.secrets:
     if not check_password(): st.stop()
 
-# --- 🛠️ ユーティリティ関数 (強化版) ---
+# --- 🛠️ ユーティリティ関数 ---
 
 def load_csv_safe(file):
-    """CSV読み込み (BOM付きUTF-8, Shift-JIS 対応 & 列名クリーニング)"""
+    """CSV読み込み (文字コード自動判別 & 列名クリーニング)"""
     try:
-        # まずは utf-8-sig (ExcelのBOM付き対応)
         df = pd.read_csv(file, encoding='utf-8-sig')
     except UnicodeDecodeError:
         try:
-            # ダメなら cp932 (Windows標準)
             file.seek(0)
             df = pd.read_csv(file, encoding='cp932')
         except:
-            # それでもダメなら utf-8
             file.seek(0)
             df = pd.read_csv(file, encoding='utf-8')
-    
-    # 列名のクリーニング (前後の空白削除)
-    df.columns = [c.strip() for c in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
     return df
 
 def find_column(df, keywords):
-    """あいまいで列名を探す (例: '学年団拘束' がダメなら '学年' を含む列を探す)"""
-    # 完全一致チェック
+    """あいまいな列名検索"""
     for col in df.columns:
-        if col in keywords:
-            return col
-    # 部分一致チェック
+        if col in keywords: return col
     for col in df.columns:
         for k in keywords:
-            if k in col:
-                return col
+            if k in col: return col
     return None
 
 def clean_bool(val):
     s = str(val).strip().upper()
-    return s in ['〇', 'TRUE', '1', 'YES', 'TRUE', '○', 'ON'] # 丸記号の表記ゆれ対応
+    return s in ['〇', 'TRUE', '1', 'YES', 'TRUE', '○', 'ON']
 
 def format_cell_text(class_name, subject_name):
     if subject_name in ['総合', '道徳', '学活', '自立']: return subject_name
-    short_class = class_name.replace('-', '')
+    short_class = str(class_name).replace('-', '')
     if subject_name == '音美': return f"★{short_class}"
     return short_class
 
 def get_grade_color(grade):
-    if grade == 1: return "#E3F2FD" 
-    if grade == 2: return "#E8F5E9" 
-    if grade == 3: return "#FFF3E0" 
+    try: g = int(grade)
+    except: g = 0
+    if g == 1: return "#E3F2FD" 
+    if g == 2: return "#E8F5E9" 
+    if g == 3: return "#FFF3E0" 
     return "#F5F5F5" 
 
 def generate_excel(df_res, classes, teacher_data, df_const):
@@ -127,7 +120,7 @@ def generate_excel(df_res, classes, teacher_data, df_const):
                         if not is_target and "年団" in target:
                             try:
                                 target_g = int(target.replace("年団",""))
-                                my_g = teacher_data[teacher_data['教員名']==t]['担当学年'].values[0]
+                                my_g = int(teacher_data[teacher_data['教員名']==t]['担当学年'].values[0])
                                 if target_g == my_g: is_target = True
                             except: pass
                         if is_target and cr['曜日'] == d and cr['限'] == p:
@@ -137,10 +130,10 @@ def generate_excel(df_res, classes, teacher_data, df_const):
             curr += 1
 
     ws_c = wb.create_sheet(title="クラス別")
-    classes = sorted(df_res['クラス'].unique())
+    classes_s = sorted(list(set(classes))) # unique & sort
     ws_c.cell(row=1, column=1, value="曜").fill = header_fill
     ws_c.cell(row=1, column=2, value="限").fill = header_fill
-    for i, c in enumerate(classes):
+    for i, c in enumerate(classes_s):
         ws_c.cell(row=1, column=3+i, value=c).fill = header_fill
     curr = 2
     for d in days:
@@ -151,7 +144,7 @@ def generate_excel(df_res, classes, teacher_data, df_const):
             bottom = thick if p==max_p else (medium if p==4 else thin)
             ws_c.cell(row=curr, column=1, value=d if p==1 else "").border = Border(top=top, bottom=bottom, left=thick, right=thin)
             ws_c.cell(row=curr, column=2, value=p).border = Border(top=top, bottom=bottom, left=thin, right=thin)
-            for i, c in enumerate(classes):
+            for i, c in enumerate(classes_s):
                 cell = ws_c.cell(row=curr, column=3+i)
                 cell.border = Border(top=top, bottom=bottom, left=thin, right=thin); cell.alignment = align_center
                 matches = df_res[(df_res['曜日']==d) & (df_res['限']==p) & (df_res['クラス']==c)]
@@ -165,21 +158,24 @@ def generate_excel(df_res, classes, teacher_data, df_const):
 def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_classes, manual_instructions):
     # 1. データ整理
     teachers = df_teacher['教員名'].tolist()
-    teacher_grade_map = dict(zip(df_teacher['教員名'], df_teacher['担当学年']))
+    # 学年マッピング (int変換)
+    teacher_grade_map = {}
+    for _, r in df_teacher.iterrows():
+        try: teacher_grade_map[r['教員名']] = int(r['担当学年'])
+        except: teacher_grade_map[r['教員名']] = 0
+
     classes = sorted(df_req['クラス'].unique())
     days = ['月', '火', '水', '木', '金']
     periods = {'月': [1,2,3,4,5,6], '火': [1,2,3,4,5,6], '水': [1,2,3,4,5,6], '木': [1,2,3,4,5,6], '金': [1,2,3,4,5]}
 
-    # 2. 教科設定の整理 (★ここを強化)
+    # 2. 教科設定
     subj_conf = {}
-    
-    # 列名の「ゆらぎ」を吸収して探す
     col_continuous = find_column(df_subj_conf, ['連続コマ', '連続', '2コマ'])
     col_block = find_column(df_subj_conf, ['学年団拘束', '学年拘束', '学年団', '拘束'])
     
     if not col_continuous or not col_block:
         st.error(f"教科設定CSVの列名が見つかりません。現在の列名: {df_subj_conf.columns.tolist()}")
-        st.stop() # ここで止めてユーザーに知らせる
+        st.stop()
 
     for _, row in df_subj_conf.iterrows():
         subj_conf[row['教科']] = {
@@ -187,7 +183,7 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
             'grade_block': clean_bool(row[col_block])
         }
 
-    # 3. 必要コマ数調整
+    # 3. 必要コマ数
     fixed_counts = collections.defaultdict(int)
     for _, row in df_const.iterrows():
         tgt = row['対象（教員名orクラス）']; content = row['内容']
@@ -262,7 +258,7 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
 
     # 学年団拘束
     for c in classes:
-        try: class_grade = int(c.split('-')[0])
+        try: class_grade = int(str(c).split('-')[0])
         except: continue
         for item in class_subjects[c]:
             if item['grade_block']:
@@ -287,7 +283,6 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
                         start_vars.append(s_var)
                         model.Add(x[(c, d, s, item['id'])] == 1).OnlyEnforceIf(s_var)
                         model.Add(x[(c, d, s+1, item['id'])] == 1).OnlyEnforceIf(s_var)
-                    # day_slots = [x[(c, d, p, item['id'])] for p in periods[d]]
 
     # 個別指示
     if manual_instructions:
@@ -397,6 +392,9 @@ if f_req and f_teacher and f_const and f_conf:
     df_const = load_csv_safe(f_const)
     df_conf = load_csv_safe(f_conf)
     
+    # 担当学年を強制的に数値化 (NaNは0に)
+    df_teacher['担当学年'] = pd.to_numeric(df_teacher['担当学年'], errors='coerce').fillna(0).astype(int)
+    
     # 診断: 列名のチェック
     st.markdown("---")
     with st.expander("🔍 デバッグ情報 (CSV読み込み状況)"):
@@ -406,7 +404,9 @@ if f_req and f_teacher and f_const and f_conf:
 
     # 教員を「表示順」でソート
     if '表示順' in df_teacher.columns:
+        df_teacher['表示順'] = pd.to_numeric(df_teacher['表示順'], errors='coerce').fillna(999)
         df_teacher = df_teacher.sort_values('表示順')
+    
     teachers = df_teacher['教員名'].tolist()
     classes = sorted(df_req['クラス'].unique().tolist())
     
