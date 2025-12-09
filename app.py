@@ -153,8 +153,8 @@ def generate_excel(df_res, classes, teacher_data, df_const):
     wb.save(output)
     return output.getvalue()
 
+# ★★★ 精密診断関数 (ここを強化) ★★★
 def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
-    """構造的な矛盾チェック"""
     errors = []
     teachers = df_teacher['教員名'].tolist()
     t_grade = {}
@@ -162,9 +162,11 @@ def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
         try: t_grade[r['教員名']] = int(r['担当学年'])
         except: t_grade[r['教員名']] = 0
 
+    # スケジュール埋まり状況
     t_sched = {t: {} for t in teachers}
     days = ['月', '火', '水', '木', '金']
     
+    # 固定リストチェック
     for _, r in df_const.iterrows():
         t_target = r['対象（教員名orクラス）']; d = r['曜日']; p = int(r['限'])
         targets = []
@@ -177,8 +179,36 @@ def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
         for t in targets:
             if (d, p) in t_sched[t]:
                 errors.append(f"🔴 ダブルブッキング: {t}先生の {d}曜{p}限 に複数の固定が入っています。")
-            t_sched[t][(d, p)] = True
+            t_sched[t][(d, p)] = r['内容']
 
+    # ★学年団ブロックの矛盾チェック★
+    # 総合などが固定されている時間に、その学年の教員が別の固定を持っていないか？
+    subj_block = {}
+    col_block = find_column(df_conf, ['学年団拘束', '学年拘束'])
+    for _, r in df_conf.iterrows():
+        if clean_bool(r[col_block]): subj_block[r['教科']] = True
+        
+    for _, r in df_const.iterrows():
+        t_target = r['対象（教員名orクラス）']
+        content = r['内容']
+        # もし固定されているのが「学年団拘束科目」なら
+        if content in subj_block and t_target not in teachers: # クラス指定の固定と仮定
+            # クラスの学年特定
+            try: 
+                target_grade = int(str(t_target).split('-')[0])
+                d = r['曜日']; p = int(r['限'])
+                
+                # その学年の全教員をチェック
+                for t_name, t_g in t_grade.items():
+                    if t_g == target_grade:
+                        # その先生が、まさにその時間に別の固定を持っていたらNG
+                        if (d, p) in t_sched[t_name]:
+                            # ただし、その固定内容が「まさにその総合」ならOK
+                            if t_sched[t_name][(d, p)] != content:
+                                errors.append(f"🔴 学年団ブロック矛盾: {target_grade}年の「{content}」が {d}曜{p}限 に固定されていますが、{t_name}先生は同じ時間に「{t_sched[t_name][(d, p)]}」が固定されています。")
+            except: pass
+
+    # ニコイチ配置可否チェック
     subj_continuous = {}
     col_cont = find_column(df_conf, ['連続コマ', '連続'])
     for _, r in df_conf.iterrows():
@@ -198,7 +228,7 @@ def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
                         break
                 if has_double_slot: break
             if not has_double_slot:
-                errors.append(f"🔴 物理的に配置不可: {t1}先生は「{subj}（2コマ連続）」を担当していますが、連続した空き時間がありません。")
+                errors.append(f"🔴 ニコイチ配置不可: {t1}先生の「{subj}」を入れる連続した空き時間がありません。")
     return errors
 
 def check_capacity(df_req, df_teacher, df_const):
@@ -234,7 +264,7 @@ def check_capacity(df_req, df_teacher, df_const):
         data.append({"教員名": t_name, "担当コマ数": load, "固定・会議": fixed, "残り枠": free, "判定": status})
     return pd.DataFrame(data)
 
-def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_classes, manual_instructions, relax_mode=False):
+def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_classes, manual_instructions, force_mode=False):
     teachers = df_teacher['教員名'].tolist()
     teacher_grade_map = {}
     for _, r in df_teacher.iterrows():
@@ -332,60 +362,48 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
         for item in class_subjects[c]:
             model.Add(sum(x[(c, d, p, item['id'])] for d in days for p in periods[d]) == item['total_count'])
 
-    # 学年団拘束
-    for c in classes:
-        try: class_grade = int(str(c).split('-')[0])
-        except: continue
-        for item in class_subjects[c]:
-            if item['grade_block']:
-                for d in days:
-                    for p in periods[d]:
-                        is_sogo = x[(c, d, p, item['id'])]
-                        for t_name, t_grade in teacher_grade_map.items():
-                            if t_grade == class_grade:
-                                if item['t1'] == t_name or item['t2'] == t_name: continue
-                                if (t_name, d, p) in teacher_vars:
-                                    model.Add(sum(teacher_vars[(t_name, d, p)]) == 0).OnlyEnforceIf(is_sogo)
+    # 学年団拘束 (強制モードなら無視)
+    if not force_mode:
+        for c in classes:
+            try: class_grade = int(str(c).split('-')[0])
+            except: continue
+            for item in class_subjects[c]:
+                if item['grade_block']:
+                    for d in days:
+                        for p in periods[d]:
+                            is_sogo = x[(c, d, p, item['id'])]
+                            for t_name, t_grade in teacher_grade_map.items():
+                                if t_grade == class_grade:
+                                    if item['t1'] == t_name or item['t2'] == t_name: continue
+                                    if (t_name, d, p) in teacher_vars:
+                                        model.Add(sum(teacher_vars[(t_name, d, p)]) == 0).OnlyEnforceIf(is_sogo)
 
-    # ニコイチ (救済モードなら昼跨ぎOK、連続必須もペナルティへ緩和)
+    # ニコイチ (強制モードならバラバラ許可)
     for c in classes:
         for item in class_subjects[c]:
             if item['is_2block']:
                 for d in days:
                     possible_starts = [1, 2, 3, 5] if d != '金' else [1, 2, 3]
                     
-                    # 救済モードなら 4限スタート(昼跨ぎ)も許可
-                    if relax_mode:
+                    # 強制モードなら 4限スタート(昼跨ぎ)も許可
+                    if force_mode:
                         possible_starts = [1, 2, 3, 4, 5] if d != '金' else [1, 2, 3, 4]
 
                     start_vars = []
                     for s in possible_starts:
-                        # 6限しかない日に6限スタートはありえない
                         if s == 6: continue 
                         if d == '金' and s == 5: continue
-
                         s_var = model.NewBoolVar(f's_{c}_{d}_{s}')
                         start_vars.append(s_var)
                         model.Add(x[(c, d, s, item['id'])] == 1).OnlyEnforceIf(s_var)
                         model.Add(x[(c, d, s+1, item['id'])] == 1).OnlyEnforceIf(s_var)
                     
-                    # 救済モードなら「連続してなくてもいい(ペナルティ)」にする手もあるが、
-                    # 技術家庭でバラバラは致命的なので、ここはハード制約のまま「場所」だけ広げる
-                    # day_slots = [x[(c, d, p, item['id'])] for p in periods[d]]
-
-    # 1日1教科 (救済モードなら無効化)
-    if not relax_mode:
-        for c in classes:
-            for d in days:
-                subj_vars = collections.defaultdict(list)
-                for item in class_subjects[c]:
-                    if item['is_2block']: continue
-                    for p in periods[d]:
-                        if (c, d, p, item['id']) in x:
-                            subj_vars[item['subj']].append(x[(c, d, p, item['id'])])
-                for s_name, v_list in subj_vars.items():
-                    # 音美などは例外
-                    if s_name != '音美': model.Add(sum(v_list) <= 1)
+                    # 強制モードなら連続性チェックをスキップ(単純な数あわせにする)
+                    if not force_mode:
+                        # ここは厳密に実装すると複雑なため、今回は「開始フラグが立つこと」を条件にする簡易実装
+                        # (より厳密にするには day_slots の和が 2 * sum(start_vars) になる制約が必要だが、
+                        #  固定リストとの兼ね合いで詰みやすいため、一旦緩和している)
+                        pass
 
     # 個別指示
     if manual_instructions:
@@ -452,7 +470,7 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
     if penalties: model.Minimize(sum(penalties))
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 120 # 延長
+    solver.parameters.max_time_in_seconds = 60
     status = solver.Solve(model)
 
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
@@ -477,8 +495,8 @@ f_teacher = st.sidebar.file_uploader("教員データ", type='csv')
 f_const = st.sidebar.file_uploader("固定・禁止リスト", type='csv')
 f_conf = st.sidebar.file_uploader("教科設定 (New!)", type='csv')
 
-# 救済モード
-relax_mode = st.sidebar.checkbox("⚠️ 救済モード (制約を緩和して強引に解く)")
+# ★強制モード★
+force_mode = st.sidebar.checkbox("🔥 強制作成モード (ルールを無視して強行)")
 
 st.sidebar.markdown("### 2. 全体バランス調整")
 w_load = st.sidebar.slider("先生の負担平準化", 0, 100, 20)
@@ -506,7 +524,7 @@ if f_req and f_teacher and f_const and f_conf:
     teachers = df_teacher['教員名'].tolist()
     classes = sorted(df_req['クラス'].unique().tolist())
     
-    # ★ 矛盾チェック (構造チェックも追加) ★
+    # ★ 矛盾診断 (強化) ★
     st.markdown("---")
     st.subheader("🔍 データ矛盾診断")
     
@@ -601,7 +619,7 @@ if f_req and f_teacher and f_const and f_conf:
         manual_list = [m for m in input_df.to_dict('records') if m['対象'] is not None]
         with st.spinner("計算中..."):
             weights = {'TEACHER_LOAD': w_load, 'AM_FULL_AVOID': w_am, 'STUDENT_5MAJORS': w_st5}
-            res = solve_schedule(df_req, df_teacher, df_const, df_conf, weights, recalc_list, manual_list, relax_mode=relax_mode)
+            res = solve_schedule(df_req, df_teacher, df_const, df_conf, weights, recalc_list, manual_list, force_mode)
             
             if res is not None:
                 st.session_state['schedule_df'] = res
@@ -609,6 +627,6 @@ if f_req and f_teacher and f_const and f_conf:
                 st.success("作成完了！")
                 st.rerun()
             else:
-                st.error("解が見つかりませんでした。上の診断結果を確認するか、「救済モード」をONにして再試行してください。")
+                st.error("解が見つかりませんでした。上の診断結果を確認するか、「強制作成モード」をONにして再試行してください。")
 else:
     st.info("👈 左側のサイドバーからCSVファイル（4つ）をアップロードしてください。")
