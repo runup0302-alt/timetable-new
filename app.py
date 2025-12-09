@@ -153,16 +153,81 @@ def generate_excel(df_res, classes, teacher_data, df_const):
     wb.save(output)
     return output.getvalue()
 
-# ★★★ 診断関数 (容量オーバー可視化) ★★★
+# ★★★ 精密診断関数 (ここを強化) ★★★
+def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
+    """構造的な矛盾（ダブルブッキング、ニコイチ不可など）をチェック"""
+    errors = []
+    
+    # 教員データの整理
+    teachers = df_teacher['教員名'].tolist()
+    t_grade = {}
+    for _, r in df_teacher.iterrows():
+        try: t_grade[r['教員名']] = int(r['担当学年'])
+        except: t_grade[r['教員名']] = 0
+
+    # 1. 教員のスケジュール表を仮組みする (False=空き, True=埋まり)
+    # {教員名: {(曜日,限): 埋まりフラグ}}
+    t_sched = {t: {} for t in teachers}
+    days = ['月', '火', '水', '木', '金']
+    
+    # 固定リストで埋める
+    for _, r in df_const.iterrows():
+        t_target = r['対象（教員名orクラス）']
+        d = r['曜日']; p = int(r['限'])
+        
+        targets = []
+        if t_target in teachers: targets = [t_target]
+        elif "年団" in t_target:
+            try:
+                g = int(t_target.replace("年団",""))
+                targets = [tn for tn, tg in t_grade.items() if tg == g]
+            except: pass
+        
+        for t in targets:
+            if (d, p) in t_sched[t]:
+                errors.append(f"🔴 ダブルブッキング: {t}先生の {d}曜{p}限 に複数の固定が入っています（{r['内容']}など）。")
+            t_sched[t][(d, p)] = True
+
+    # 2. クラスごとに必要な「ニコイチ」が入るかチェック
+    # 教科設定
+    subj_continuous = {}
+    col_cont = find_column(df_conf, ['連続コマ', '連続'])
+    for _, r in df_conf.iterrows():
+        if clean_bool(r[col_cont]): subj_continuous[r['教科']] = True
+
+    # 授業データから「ニコイチが必要な先生」を探す
+    for _, r in df_req.iterrows():
+        subj = r['教科']; t1 = r['担当教員']
+        if subj in subj_continuous and pd.notna(t1) and t1 in teachers:
+            # 固定されている分を除いて、あと何回ニコイチが必要か？
+            # (簡易チェックのため、とりあえず「ニコイチ可能な空きスロット」があるかだけ見る)
+            
+            # t1先生のスケジュールを見て、連続した空きがあるか？
+            has_double_slot = False
+            for d in days:
+                periods = [1,2,3,4,5,6] if d != '金' else [1,2,3,4,5]
+                # 昼跨ぎ禁止 (4-5はNG)
+                for i in range(len(periods)-1):
+                    p1 = periods[i]; p2 = periods[i+1]
+                    if p1 == 4 and p2 == 5: continue 
+                    
+                    # 両方空いていればOK
+                    if (d, p1) not in t_sched[t1] and (d, p2) not in t_sched[t1]:
+                        has_double_slot = True
+                        break
+                if has_double_slot: break
+            
+            if not has_double_slot:
+                errors.append(f"🔴 物理的に配置不可: {t1}先生は「{subj}（2コマ連続）」を担当していますが、固定や会議で埋まっており、2コマ連続で空いている時間が1つもありません。")
+
+    return errors
+
 def check_capacity(df_req, df_teacher, df_const):
-    """教員の持ちコマ数と空きコマ数を計算してテーブルを返す"""
-    # 1. 授業コマ数の集計 (固定引き算前)
     t_load = collections.defaultdict(int)
     for _, r in df_req.iterrows():
         if pd.notna(r['担当教員']): t_load[r['担当教員']] += int(r['週コマ数'])
         if pd.notna(r['担当教員２']): t_load[r['担当教員２']] += int(r['週コマ数'])
     
-    # 2. 固定・会議コマ数の集計
     t_fixed = collections.defaultdict(int)
     t_grade = {}
     for _, r in df_teacher.iterrows():
@@ -171,40 +236,28 @@ def check_capacity(df_req, df_teacher, df_const):
 
     for _, r in df_const.iterrows():
         t = r['対象（教員名orクラス）']
-        if t in t_grade: t_fixed[t] += 1 # 個人指定
-        elif "年団" in t: # 学年団指定
+        if t in t_grade: t_fixed[t] += 1
+        elif "年団" in t:
             try:
                 g = int(t.replace("年団",""))
                 for t_name, tg in t_grade.items():
                     if tg == g: t_fixed[t_name] += 1
             except: pass
             
-    # 3. データフレーム作成
     data = []
-    TOTAL_SLOTS = 29 # 月~金(6*4+5)
-    
+    TOTAL_SLOTS = 29
     for t_name in df_teacher['教員名']:
         load = t_load.get(t_name, 0)
         fixed = t_fixed.get(t_name, 0)
         free = TOTAL_SLOTS - fixed
         balance = free - load
-        
         status = "✅ OK"
         if balance < 0: status = "🔴 容量オーバー"
         elif balance <= 2: status = "⚠️ 余裕なし"
-        
-        data.append({
-            "教員名": t_name,
-            "担当コマ数": load,
-            "固定・会議": fixed,
-            "残り枠": free,
-            "判定": status
-        })
-        
+        data.append({"教員名": t_name, "担当コマ数": load, "固定・会議": fixed, "残り枠": free, "判定": status})
     return pd.DataFrame(data)
 
 def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_classes, manual_instructions):
-    # 1. データ整理
     teachers = df_teacher['教員名'].tolist()
     teacher_grade_map = {}
     for _, r in df_teacher.iterrows():
@@ -215,13 +268,12 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
     days = ['月', '火', '水', '木', '金']
     periods = {'月': [1,2,3,4,5,6], '火': [1,2,3,4,5,6], '水': [1,2,3,4,5,6], '木': [1,2,3,4,5,6], '金': [1,2,3,4,5]}
 
-    # 2. 教科設定
     subj_conf = {}
     col_continuous = find_column(df_subj_conf, ['連続コマ', '連続', '2コマ'])
     col_block = find_column(df_subj_conf, ['学年団拘束', '学年拘束', '学年団', '拘束'])
     
     if not col_continuous or not col_block:
-        st.error(f"教科設定CSVの列名が見つかりません。現在の列名: {df_subj_conf.columns.tolist()}")
+        st.error(f"教科設定CSVの列名が見つかりません。")
         st.stop()
 
     for _, row in df_subj_conf.iterrows():
@@ -230,7 +282,6 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
             'grade_block': clean_bool(row[col_block])
         }
 
-    # 3. 必要コマ数
     fixed_counts = collections.defaultdict(int)
     for _, row in df_const.iterrows():
         tgt = row['対象（教員名orクラス）']; content = row['内容']
@@ -281,11 +332,8 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
         try: p = int(row['限'])
         except: continue
         
-        # A. 教員指定
         if target in teachers:
             if (target, d, p) in teacher_vars: model.Add(sum(teacher_vars[(target, d, p)]) == 0)
-        
-        # B. 学年団指定
         elif "年団" in target:
             try:
                 target_grade = int(target.replace("年団", ""))
@@ -293,8 +341,6 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
                     if t_grade == target_grade:
                          if (t_name, d, p) in teacher_vars: model.Add(sum(teacher_vars[(t_name, d, p)]) == 0)
             except: pass
-        
-        # C. クラス指定
         elif target in classes:
             found_subj = False
             for item in class_subjects[target]:
@@ -439,15 +485,12 @@ recalc_list = [x.strip() for x in recalc_str.split(',')] if recalc_str else []
 st.title("🏫 中学校時間割 AI作成システム (完全汎用版)")
 
 if f_req and f_teacher and f_const and f_conf:
-    # 読み込み
     df_req = load_csv_safe(f_req)
     df_teacher = load_csv_safe(f_teacher)
     df_const = load_csv_safe(f_const)
     df_conf = load_csv_safe(f_conf)
     
-    # 担当学年を強制的に数値化
     df_teacher['担当学年'] = pd.to_numeric(df_teacher['担当学年'], errors='coerce').fillna(0).astype(int)
-    # 表示順を強制的に数値化
     if '表示順' in df_teacher.columns:
         df_teacher['表示順'] = pd.to_numeric(df_teacher['表示順'], errors='coerce').fillna(999)
         df_teacher = df_teacher.sort_values('表示順')
@@ -455,6 +498,30 @@ if f_req and f_teacher and f_const and f_conf:
     teachers = df_teacher['教員名'].tolist()
     classes = sorted(df_req['クラス'].unique().tolist())
     
+    # ★ 事前矛盾チェック (強化版) ★
+    st.markdown("---")
+    st.subheader("🔍 データ矛盾診断")
+    
+    # 1. 構造チェック (ダブルブッキング, ニコイチ不可)
+    struct_errors = check_structural_conflicts(df_req, df_teacher, df_const, df_conf)
+    if struct_errors:
+        st.error("⚠️ 構造的な矛盾が見つかりました (このままでは解なしになります)")
+        for e in struct_errors: st.write(e)
+    else:
+        st.success("✅ 固定リストの配置に問題はありません。")
+
+    # 2. 容量チェック
+    cap_df = check_capacity(df_req, df_teacher, df_const)
+    error_rows = cap_df[cap_df['判定'].str.contains("🔴")]
+    if not error_rows.empty:
+        st.error("⚠️ 以下の先生のコマ数がパンクしています！")
+        st.dataframe(error_rows)
+    else:
+        st.success("✅ 教員のコマ数容量はOKです。")
+        with st.expander("詳細を見る"): st.dataframe(cap_df)
+    
+    st.markdown("---")
+
     # 個別指示
     st.markdown("### 🗣️ 個別指示機能")
     if 'instructions' not in st.session_state:
@@ -525,20 +592,6 @@ if f_req and f_teacher and f_const and f_conf:
 
     st.divider()
     if st.button("🚀 作成開始 (再計算)", type="primary"):
-        # ★ 計算前に容量チェックを表示
-        st.subheader("📊 容量チェック (計算前診断)")
-        cap_df = check_capacity(df_req, df_teacher, df_const)
-        
-        # エラーがある人だけ赤く表示して目立たせる
-        error_rows = cap_df[cap_df['判定'].str.contains("🔴")]
-        if not error_rows.empty:
-            st.error("⚠️ 以下の先生のコマ数がパンクしています！このままでは解が見つかりません。")
-            st.dataframe(error_rows)
-        else:
-            st.success("✅ 教員のコマ数容量はOKです。")
-            with st.expander("詳細を見る"):
-                st.dataframe(cap_df)
-
         manual_list = [m for m in input_df.to_dict('records') if m['対象'] is not None]
         with st.spinner("計算中..."):
             weights = {'TEACHER_LOAD': w_load, 'AM_FULL_AVOID': w_am, 'STUDENT_5MAJORS': w_st5}
@@ -550,6 +603,6 @@ if f_req and f_teacher and f_const and f_conf:
                 st.success("作成完了！")
                 st.rerun()
             else:
-                st.error("解が見つかりませんでした。上の「容量チェック」や固定リストを確認してください。")
+                st.error("解が見つかりませんでした。上の診断結果（赤い表示）を確認してください。")
 else:
     st.info("👈 左側のサイドバーからCSVファイル（4つ）をアップロードしてください。")
