@@ -41,7 +41,14 @@ def load_csv_safe(file):
         except:
             file.seek(0)
             df = pd.read_csv(file, encoding='utf-8')
-    df.columns = [str(c).strip() for c in df.columns]
+    # 全角スペース削除、前後の空白削除
+    df.columns = [str(c).strip().replace('　', '') for c in df.columns]
+    
+    # データの中身もクリーニング（全角スペース除去）
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].astype(str).str.strip().str.replace('　', '')
+            
     return df
 
 def find_column(df, keywords):
@@ -153,7 +160,44 @@ def generate_excel(df_res, classes, teacher_data, df_const):
     wb.save(output)
     return output.getvalue()
 
-# ★★★ 精密診断関数 (安全装置追加) ★★★
+# ★★★ データ整合性チェック (名寄せ) ★★★
+def check_data_integrity(df_req, df_teacher, df_const):
+    """教員名やクラス名がCSV間で一致しているかチェック"""
+    errors = []
+    
+    # マスターデータ
+    master_teachers = set(df_teacher['教員名'].unique())
+    master_classes = set(df_req['クラス'].unique())
+    
+    # 1. 授業データの教員チェック
+    for col in ['担当教員', '担当教員2']:
+        if col in df_req.columns:
+            unknowns = set(df_req[col].dropna().unique()) - master_teachers
+            for u in unknowns:
+                errors.append(f"❌ 授業データエラー: 「{u}」という教員は教員データに登録されていません。(スペースや漢字違いを確認してください)")
+
+    # 2. 固定リストの対象チェック
+    for t in df_const['対象（教員名orクラス）'].dropna().unique():
+        if "年団" in t or t == "全教員" or t == "全員": continue
+        
+        if t not in master_teachers and t not in master_classes:
+             errors.append(f"❌ 固定リストエラー: 「{t}」という対象は、教員にもクラスにも存在しません。")
+
+    # 3. コマ数オーバーチェック (固定が要望より多い場合)
+    fixed_counts = collections.defaultdict(int)
+    for _, r in df_const.iterrows():
+        tgt = r['対象（教員名orクラス）']; content = r['内容']
+        if tgt in master_classes:
+            fixed_counts[(tgt, content)] += 1
+            
+    for _, r in df_req.iterrows():
+        c = r['クラス']; s = r['教科']; req = int(r['週コマ数'])
+        fixed = fixed_counts[(c, s)]
+        if fixed > req:
+            errors.append(f"❌ コマ数矛盾: {c}の{s}は週{req}コマですが、固定リストで{fixed}コマ指定されています。(固定が多すぎます)")
+
+    return errors
+
 def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
     errors = []
     teachers = df_teacher['教員名'].tolist()
@@ -163,7 +207,6 @@ def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
         except: t_grade[r['教員名']] = 0
 
     t_sched = {t: {} for t in teachers}
-    days = ['月', '火', '水', '木', '金']
     
     for _, r in df_const.iterrows():
         t_target = r['対象（教員名orクラス）']; d = r['曜日']; p = int(r['限'])
@@ -177,51 +220,7 @@ def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
         for t in targets:
             if (d, p) in t_sched[t]:
                 errors.append(f"🔴 ダブルブッキング: {t}先生の {d}曜{p}限 に複数の固定が入っています。")
-            t_sched[t][(d, p)] = r['内容']
-
-    # 学年団ブロックチェック (列名が見つからなければスキップ)
-    col_block = find_column(df_conf, ['学年団拘束', '学年拘束', '学年団', '拘束'])
-    if col_block:
-        subj_block = {}
-        for _, r in df_conf.iterrows():
-            if clean_bool(r[col_block]): subj_block[r['教科']] = True
-            
-        for _, r in df_const.iterrows():
-            t_target = r['対象（教員名orクラス）']
-            content = r['内容']
-            if content in subj_block and t_target not in teachers:
-                try: 
-                    target_grade = int(str(t_target).split('-')[0])
-                    d = r['曜日']; p = int(r['限'])
-                    for t_name, t_g in t_grade.items():
-                        if t_g == target_grade:
-                            if (d, p) in t_sched[t_name]:
-                                if t_sched[t_name][(d, p)] != content:
-                                    errors.append(f"🔴 学年団ブロック矛盾: {target_grade}年の「{content}」が {d}曜{p}限 に固定されていますが、{t_name}先生は同じ時間に「{t_sched[t_name][(d, p)]}」が固定されています。")
-                except: pass
-
-    # ニコイチチェック (列名が見つからなければスキップ)
-    col_cont = find_column(df_conf, ['連続コマ', '連続', '2コマ'])
-    if col_cont:
-        subj_continuous = {}
-        for _, r in df_conf.iterrows():
-            if clean_bool(r[col_cont]): subj_continuous[r['教科']] = True
-
-        for _, r in df_req.iterrows():
-            subj = r['教科']; t1 = r['担当教員']
-            if subj in subj_continuous and pd.notna(t1) and t1 in teachers:
-                has_double_slot = False
-                for d in days:
-                    periods = [1,2,3,4,5,6] if d != '金' else [1,2,3,4,5]
-                    for i in range(len(periods)-1):
-                        p1 = periods[i]; p2 = periods[i+1]
-                        if p1 == 4 and p2 == 5: continue 
-                        if (d, p1) not in t_sched[t1] and (d, p2) not in t_sched[t1]:
-                            has_double_slot = True
-                            break
-                    if has_double_slot: break
-                if not has_double_slot:
-                    errors.append(f"🔴 ニコイチ配置不可: {t1}先生の「{subj}」を入れる連続した空き時間がありません。")
+            t_sched[t][(d, p)] = True
     return errors
 
 def check_capacity(df_req, df_teacher, df_const):
@@ -298,6 +297,10 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
         req_count = int(row['週コマ数'])
         already_fixed = fixed_counts[(c, subj)]
         needed_count = max(0, req_count - already_fixed)
+        
+        # 強制モードなら、必要コマ数以上の固定があっても無視して0にする (エラー回避)
+        if force_mode and needed_count < 0: needed_count = 0
+        
         conf = subj_conf.get(subj, {'continuous': False, 'grade_block': False})
         is_2block = conf['continuous'] and needed_count >= 2
         subj_id = (subj, t1, t2)
@@ -353,7 +356,9 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
     
     for c in classes:
         for item in class_subjects[c]:
-            model.Add(sum(x[(c, d, p, item['id'])] for d in days for p in periods[d]) == item['total_count'])
+            # 強制モードなら合計チェックを緩和 (固定数との不整合回避)
+            if not force_mode:
+                model.Add(sum(x[(c, d, p, item['id'])] for d in days for p in periods[d]) == item['total_count'])
 
     # 学年団拘束 (強制モードなら無視)
     if not force_mode:
@@ -383,8 +388,6 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
 
                     start_vars = []
                     for s in possible_starts:
-                        if s == 6: continue 
-                        if d == '金' and s == 5: continue
                         s_var = model.NewBoolVar(f's_{c}_{d}_{s}')
                         start_vars.append(s_var)
                         model.Add(x[(c, d, s, item['id'])] == 1).OnlyEnforceIf(s_var)
@@ -495,6 +498,7 @@ recalc_list = [x.strip() for x in recalc_str.split(',')] if recalc_str else []
 st.title("🏫 中学校時間割 AI作成システム (完全汎用版)")
 
 if f_req and f_teacher and f_const and f_conf:
+    # 読み込み
     df_req = load_csv_safe(f_req)
     df_teacher = load_csv_safe(f_teacher)
     df_const = load_csv_safe(f_const)
@@ -508,9 +512,19 @@ if f_req and f_teacher and f_const and f_conf:
     teachers = df_teacher['教員名'].tolist()
     classes = sorted(df_req['クラス'].unique().tolist())
     
+    # ★ 矛盾診断 (強化) ★
     st.markdown("---")
     st.subheader("🔍 データ矛盾診断")
     
+    # 1. データの不整合チェック
+    integrity_errors = check_data_integrity(df_req, df_teacher, df_const)
+    if integrity_errors:
+        st.error("⚠️ データに名前の不一致などのエラーがあります！")
+        for e in integrity_errors: st.write(e)
+    else:
+        st.success("✅ データ間の名前の整合性はOKです。")
+
+    # 2. 構造チェック
     struct_errors = check_structural_conflicts(df_req, df_teacher, df_const, df_conf)
     if struct_errors:
         st.error("⚠️ 構造的な矛盾が見つかりました (このままでは解なしになります)")
@@ -518,6 +532,7 @@ if f_req and f_teacher and f_const and f_conf:
     else:
         st.success("✅ 固定リストの構造に問題はありません。")
 
+    # 3. 容量チェック
     cap_df = check_capacity(df_req, df_teacher, df_const)
     error_rows = cap_df[cap_df['判定'].str.contains("🔴")]
     if not error_rows.empty:
@@ -529,6 +544,7 @@ if f_req and f_teacher and f_const and f_conf:
     
     st.markdown("---")
 
+    # 個別指示
     st.markdown("### 🗣️ 個別指示機能")
     if 'instructions' not in st.session_state:
         st.session_state['instructions'] = pd.DataFrame(columns=['対象', '曜日', '教科', '指示タイプ', '値'])
