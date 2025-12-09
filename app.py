@@ -153,28 +153,20 @@ def generate_excel(df_res, classes, teacher_data, df_const):
     wb.save(output)
     return output.getvalue()
 
-# ★★★ 精密診断関数 (ここを強化) ★★★
 def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
-    """構造的な矛盾（ダブルブッキング、ニコイチ不可など）をチェック"""
+    """構造的な矛盾チェック"""
     errors = []
-    
-    # 教員データの整理
     teachers = df_teacher['教員名'].tolist()
     t_grade = {}
     for _, r in df_teacher.iterrows():
         try: t_grade[r['教員名']] = int(r['担当学年'])
         except: t_grade[r['教員名']] = 0
 
-    # 1. 教員のスケジュール表を仮組みする (False=空き, True=埋まり)
-    # {教員名: {(曜日,限): 埋まりフラグ}}
     t_sched = {t: {} for t in teachers}
     days = ['月', '火', '水', '木', '金']
     
-    # 固定リストで埋める
     for _, r in df_const.iterrows():
-        t_target = r['対象（教員名orクラス）']
-        d = r['曜日']; p = int(r['限'])
-        
+        t_target = r['対象（教員名orクラス）']; d = r['曜日']; p = int(r['限'])
         targets = []
         if t_target in teachers: targets = [t_target]
         elif "年団" in t_target:
@@ -182,44 +174,31 @@ def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
                 g = int(t_target.replace("年団",""))
                 targets = [tn for tn, tg in t_grade.items() if tg == g]
             except: pass
-        
         for t in targets:
             if (d, p) in t_sched[t]:
-                errors.append(f"🔴 ダブルブッキング: {t}先生の {d}曜{p}限 に複数の固定が入っています（{r['内容']}など）。")
+                errors.append(f"🔴 ダブルブッキング: {t}先生の {d}曜{p}限 に複数の固定が入っています。")
             t_sched[t][(d, p)] = True
 
-    # 2. クラスごとに必要な「ニコイチ」が入るかチェック
-    # 教科設定
     subj_continuous = {}
     col_cont = find_column(df_conf, ['連続コマ', '連続'])
     for _, r in df_conf.iterrows():
         if clean_bool(r[col_cont]): subj_continuous[r['教科']] = True
 
-    # 授業データから「ニコイチが必要な先生」を探す
     for _, r in df_req.iterrows():
         subj = r['教科']; t1 = r['担当教員']
         if subj in subj_continuous and pd.notna(t1) and t1 in teachers:
-            # 固定されている分を除いて、あと何回ニコイチが必要か？
-            # (簡易チェックのため、とりあえず「ニコイチ可能な空きスロット」があるかだけ見る)
-            
-            # t1先生のスケジュールを見て、連続した空きがあるか？
             has_double_slot = False
             for d in days:
                 periods = [1,2,3,4,5,6] if d != '金' else [1,2,3,4,5]
-                # 昼跨ぎ禁止 (4-5はNG)
                 for i in range(len(periods)-1):
                     p1 = periods[i]; p2 = periods[i+1]
                     if p1 == 4 and p2 == 5: continue 
-                    
-                    # 両方空いていればOK
                     if (d, p1) not in t_sched[t1] and (d, p2) not in t_sched[t1]:
                         has_double_slot = True
                         break
                 if has_double_slot: break
-            
             if not has_double_slot:
-                errors.append(f"🔴 物理的に配置不可: {t1}先生は「{subj}（2コマ連続）」を担当していますが、固定や会議で埋まっており、2コマ連続で空いている時間が1つもありません。")
-
+                errors.append(f"🔴 物理的に配置不可: {t1}先生は「{subj}（2コマ連続）」を担当していますが、連続した空き時間がありません。")
     return errors
 
 def check_capacity(df_req, df_teacher, df_const):
@@ -247,17 +226,15 @@ def check_capacity(df_req, df_teacher, df_const):
     data = []
     TOTAL_SLOTS = 29
     for t_name in df_teacher['教員名']:
-        load = t_load.get(t_name, 0)
-        fixed = t_fixed.get(t_name, 0)
-        free = TOTAL_SLOTS - fixed
-        balance = free - load
+        load = t_load.get(t_name, 0); fixed = t_fixed.get(t_name, 0)
+        free = TOTAL_SLOTS - fixed; balance = free - load
         status = "✅ OK"
         if balance < 0: status = "🔴 容量オーバー"
         elif balance <= 2: status = "⚠️ 余裕なし"
         data.append({"教員名": t_name, "担当コマ数": load, "固定・会議": fixed, "残り枠": free, "判定": status})
     return pd.DataFrame(data)
 
-def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_classes, manual_instructions):
+def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_classes, manual_instructions, relax_mode=False):
     teachers = df_teacher['教員名'].tolist()
     teacher_grade_map = {}
     for _, r in df_teacher.iterrows():
@@ -370,18 +347,45 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
                                 if (t_name, d, p) in teacher_vars:
                                     model.Add(sum(teacher_vars[(t_name, d, p)]) == 0).OnlyEnforceIf(is_sogo)
 
-    # ニコイチ
+    # ニコイチ (救済モードなら昼跨ぎOK、連続必須もペナルティへ緩和)
     for c in classes:
         for item in class_subjects[c]:
             if item['is_2block']:
                 for d in days:
                     possible_starts = [1, 2, 3, 5] if d != '金' else [1, 2, 3]
+                    
+                    # 救済モードなら 4限スタート(昼跨ぎ)も許可
+                    if relax_mode:
+                        possible_starts = [1, 2, 3, 4, 5] if d != '金' else [1, 2, 3, 4]
+
                     start_vars = []
                     for s in possible_starts:
+                        # 6限しかない日に6限スタートはありえない
+                        if s == 6: continue 
+                        if d == '金' and s == 5: continue
+
                         s_var = model.NewBoolVar(f's_{c}_{d}_{s}')
                         start_vars.append(s_var)
                         model.Add(x[(c, d, s, item['id'])] == 1).OnlyEnforceIf(s_var)
                         model.Add(x[(c, d, s+1, item['id'])] == 1).OnlyEnforceIf(s_var)
+                    
+                    # 救済モードなら「連続してなくてもいい(ペナルティ)」にする手もあるが、
+                    # 技術家庭でバラバラは致命的なので、ここはハード制約のまま「場所」だけ広げる
+                    # day_slots = [x[(c, d, p, item['id'])] for p in periods[d]]
+
+    # 1日1教科 (救済モードなら無効化)
+    if not relax_mode:
+        for c in classes:
+            for d in days:
+                subj_vars = collections.defaultdict(list)
+                for item in class_subjects[c]:
+                    if item['is_2block']: continue
+                    for p in periods[d]:
+                        if (c, d, p, item['id']) in x:
+                            subj_vars[item['subj']].append(x[(c, d, p, item['id'])])
+                for s_name, v_list in subj_vars.items():
+                    # 音美などは例外
+                    if s_name != '音美': model.Add(sum(v_list) <= 1)
 
     # 個別指示
     if manual_instructions:
@@ -448,7 +452,7 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
     if penalties: model.Minimize(sum(penalties))
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 60
+    solver.parameters.max_time_in_seconds = 120 # 延長
     status = solver.Solve(model)
 
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
@@ -473,6 +477,9 @@ f_teacher = st.sidebar.file_uploader("教員データ", type='csv')
 f_const = st.sidebar.file_uploader("固定・禁止リスト", type='csv')
 f_conf = st.sidebar.file_uploader("教科設定 (New!)", type='csv')
 
+# 救済モード
+relax_mode = st.sidebar.checkbox("⚠️ 救済モード (制約を緩和して強引に解く)")
+
 st.sidebar.markdown("### 2. 全体バランス調整")
 w_load = st.sidebar.slider("先生の負担平準化", 0, 100, 20)
 w_am = st.sidebar.slider("午前満タン回避", 0, 100, 30)
@@ -485,6 +492,7 @@ recalc_list = [x.strip() for x in recalc_str.split(',')] if recalc_str else []
 st.title("🏫 中学校時間割 AI作成システム (完全汎用版)")
 
 if f_req and f_teacher and f_const and f_conf:
+    # 読み込み
     df_req = load_csv_safe(f_req)
     df_teacher = load_csv_safe(f_teacher)
     df_const = load_csv_safe(f_const)
@@ -498,19 +506,17 @@ if f_req and f_teacher and f_const and f_conf:
     teachers = df_teacher['教員名'].tolist()
     classes = sorted(df_req['クラス'].unique().tolist())
     
-    # ★ 事前矛盾チェック (強化版) ★
+    # ★ 矛盾チェック (構造チェックも追加) ★
     st.markdown("---")
     st.subheader("🔍 データ矛盾診断")
     
-    # 1. 構造チェック (ダブルブッキング, ニコイチ不可)
     struct_errors = check_structural_conflicts(df_req, df_teacher, df_const, df_conf)
     if struct_errors:
         st.error("⚠️ 構造的な矛盾が見つかりました (このままでは解なしになります)")
         for e in struct_errors: st.write(e)
     else:
-        st.success("✅ 固定リストの配置に問題はありません。")
+        st.success("✅ 固定リストの構造に問題はありません。")
 
-    # 2. 容量チェック
     cap_df = check_capacity(df_req, df_teacher, df_const)
     error_rows = cap_df[cap_df['判定'].str.contains("🔴")]
     if not error_rows.empty:
@@ -595,7 +601,7 @@ if f_req and f_teacher and f_const and f_conf:
         manual_list = [m for m in input_df.to_dict('records') if m['対象'] is not None]
         with st.spinner("計算中..."):
             weights = {'TEACHER_LOAD': w_load, 'AM_FULL_AVOID': w_am, 'STUDENT_5MAJORS': w_st5}
-            res = solve_schedule(df_req, df_teacher, df_const, df_conf, weights, recalc_list, manual_list)
+            res = solve_schedule(df_req, df_teacher, df_const, df_conf, weights, recalc_list, manual_list, relax_mode=relax_mode)
             
             if res is not None:
                 st.session_state['schedule_df'] = res
@@ -603,6 +609,6 @@ if f_req and f_teacher and f_const and f_conf:
                 st.success("作成完了！")
                 st.rerun()
             else:
-                st.error("解が見つかりませんでした。上の診断結果（赤い表示）を確認してください。")
+                st.error("解が見つかりませんでした。上の診断結果を確認するか、「救済モード」をONにして再試行してください。")
 else:
     st.info("👈 左側のサイドバーからCSVファイル（4つ）をアップロードしてください。")
