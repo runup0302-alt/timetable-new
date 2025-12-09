@@ -32,7 +32,6 @@ if "PASSWORD" in st.secrets:
 # --- 🛠️ ユーティリティ関数 ---
 
 def load_csv_safe(file):
-    """CSV読み込み (文字コード自動判別 & 列名クリーニング)"""
     try:
         df = pd.read_csv(file, encoding='utf-8-sig')
     except UnicodeDecodeError:
@@ -46,7 +45,6 @@ def load_csv_safe(file):
     return df
 
 def find_column(df, keywords):
-    """あいまいな列名検索"""
     for col in df.columns:
         if col in keywords: return col
     for col in df.columns:
@@ -130,7 +128,7 @@ def generate_excel(df_res, classes, teacher_data, df_const):
             curr += 1
 
     ws_c = wb.create_sheet(title="クラス別")
-    classes_s = sorted(list(set(classes))) # unique & sort
+    classes_s = sorted(list(set(classes)))
     ws_c.cell(row=1, column=1, value="曜").fill = header_fill
     ws_c.cell(row=1, column=2, value="限").fill = header_fill
     for i, c in enumerate(classes_s):
@@ -155,10 +153,67 @@ def generate_excel(df_res, classes, teacher_data, df_const):
     wb.save(output)
     return output.getvalue()
 
+# ★★★ 診断関数 ★★★
+def check_data_conflicts(df_req, df_teacher, df_const):
+    """データ矛盾の事前チェック"""
+    errors = []
+    
+    # 1. 学年団ブロックの矛盾 (月6は1年のみ)
+    # 2年以上の先生が、月6に固定されていないかチェック
+    # (月6以外にも拡張できるように、汎用チェックを入れるとベストだが、まずは月6)
+    
+    # 教員の学年マップ
+    t_grade = {}
+    for _, r in df_teacher.iterrows():
+        try: t_grade[r['教員名']] = int(r['担当学年'])
+        except: t_grade[r['教員名']] = 0
+        
+    for _, r in df_const.iterrows():
+        t = r['対象（教員名orクラス）']
+        d = r['曜日']
+        p = str(r['限'])
+        
+        # 月曜6限チェック
+        if d == '月' and p == '6':
+            # 教員名指定の場合
+            if t in t_grade:
+                if t_grade[t] != 1 and t_grade[t] != 0:
+                    errors.append(f"🔴 矛盾: {t}先生({t_grade[t]}年)が「月曜6限」に固定されていますが、月6は1年生専用です。")
+            # 学年団指定の場合
+            elif "年団" in t:
+                try:
+                    g = int(t.replace("年団",""))
+                    if g != 1:
+                        errors.append(f"🔴 矛盾: 「{t}」が「月曜6限」に固定されていますが、月6は1年生専用です。")
+                except: pass
+
+    # 2. コマ数オーバーチェック
+    # 教員ごとの持ちコマ数
+    t_load = collections.defaultdict(int)
+    for _, r in df_req.iterrows():
+        if pd.notna(r['担当教員']): t_load[r['担当教員']] += int(r['週コマ数'])
+        if pd.notna(r['担当教員２']): t_load[r['担当教員２']] += int(r['週コマ数'])
+    
+    # 教員ごとの固定数
+    t_fixed = collections.defaultdict(int)
+    for _, r in df_const.iterrows():
+        t = r['対象（教員名orクラス）']
+        if t in t_grade: t_fixed[t] += 1
+        
+    # チェック
+    for t, load in t_load.items():
+        fixed = t_fixed.get(t, 0)
+        # 全コマ数 - 固定数
+        # 月〜金(29コマ) - 固定数 < 持ちコマ数 なら破綻
+        # (簡易計算)
+        if 29 - fixed < load:
+            errors.append(f"🔴 容量オーバー: {t}先生は週{load}コマ担当ですが、固定・会議等で空き枠が足りません。")
+
+    return errors
+
 def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_classes, manual_instructions):
     # 1. データ整理
     teachers = df_teacher['教員名'].tolist()
-    # 学年マッピング (int変換)
     teacher_grade_map = {}
     for _, r in df_teacher.iterrows():
         try: teacher_grade_map[r['教員名']] = int(r['担当学年'])
@@ -233,8 +288,12 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
         target = row['対象（教員名orクラス）']; d = row['曜日']; content = row['内容']
         try: p = int(row['限'])
         except: continue
+        
+        # A. 教員指定
         if target in teachers:
             if (target, d, p) in teacher_vars: model.Add(sum(teacher_vars[(target, d, p)]) == 0)
+        
+        # B. 学年団指定
         elif "年団" in target:
             try:
                 target_grade = int(target.replace("年団", ""))
@@ -242,6 +301,8 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
                     if t_grade == target_grade:
                          if (t_name, d, p) in teacher_vars: model.Add(sum(teacher_vars[(t_name, d, p)]) == 0)
             except: pass
+        
+        # C. クラス指定
         elif target in classes:
             found_subj = False
             for item in class_subjects[target]:
@@ -252,6 +313,13 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
                 for item in class_subjects[target]:
                     if (target, d, p, item['id']) in x: model.Add(x[(target, d, p, item['id'])] == 0)
     
+    # ★月6学年ブロック (ハードコーディング)
+    # 月曜6限は、担当学年が1(または0)以外の教員は授業不可
+    for t_name, t_grade in teacher_grade_map.items():
+        if t_grade != 1 and t_grade != 0:
+            if (t_name, '月', 6) in teacher_vars:
+                model.Add(sum(teacher_vars[(t_name, '月', 6)]) == 0)
+
     for c in classes:
         for item in class_subjects[c]:
             model.Add(sum(x[(c, d, p, item['id'])] for d in days for p in periods[d]) == item['total_count'])
@@ -386,29 +454,28 @@ recalc_list = [x.strip() for x in recalc_str.split(',')] if recalc_str else []
 st.title("🏫 中学校時間割 AI作成システム (完全汎用版)")
 
 if f_req and f_teacher and f_const and f_conf:
-    # 読み込み (安全策)
+    # 読み込み
     df_req = load_csv_safe(f_req)
     df_teacher = load_csv_safe(f_teacher)
     df_const = load_csv_safe(f_const)
     df_conf = load_csv_safe(f_conf)
     
-    # 担当学年を強制的に数値化 (NaNは0に)
+    # 担当学年を強制的に数値化
     df_teacher['担当学年'] = pd.to_numeric(df_teacher['担当学年'], errors='coerce').fillna(0).astype(int)
-    
-    # 診断: 列名のチェック
-    st.markdown("---")
-    with st.expander("🔍 デバッグ情報 (CSV読み込み状況)"):
-        st.write("教員データ:", df_teacher.columns.tolist())
-        st.write("教科設定:", df_conf.columns.tolist())
-        st.write("固定リスト:", df_const.columns.tolist())
-
-    # 教員を「表示順」でソート
+    # 表示順を強制的に数値化
     if '表示順' in df_teacher.columns:
         df_teacher['表示順'] = pd.to_numeric(df_teacher['表示順'], errors='coerce').fillna(999)
         df_teacher = df_teacher.sort_values('表示順')
     
     teachers = df_teacher['教員名'].tolist()
     classes = sorted(df_req['クラス'].unique().tolist())
+    
+    # ★ 事前矛盾チェック ★
+    errors = check_data_conflicts(df_req, df_teacher, df_const)
+    if errors:
+        st.error("⚠️ データの矛盾が見つかりました。このままだと「解なし」になります。")
+        for e in errors:
+            st.write(e)
     
     # 個別指示
     st.markdown("### 🗣️ 個別指示機能")
@@ -491,6 +558,6 @@ if f_req and f_teacher and f_const and f_conf:
                 st.success("作成完了！")
                 st.rerun()
             else:
-                st.error("解が見つかりませんでした。")
+                st.error("解が見つかりませんでした。設定した「固定・禁止リスト」や「個別指示」に矛盾がないか確認してください。")
 else:
     st.info("👈 左側のサイドバーからCSVファイル（4つ）をアップロードしてください。")
