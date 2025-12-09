@@ -153,41 +153,11 @@ def generate_excel(df_res, classes, teacher_data, df_const):
     wb.save(output)
     return output.getvalue()
 
-# ★★★ 診断関数 ★★★
+# ★★★ 診断関数 (余計なチェックを削除) ★★★
 def check_data_conflicts(df_req, df_teacher, df_const):
     """データ矛盾の事前チェック"""
     errors = []
     
-    # 1. 学年団ブロックの矛盾 (月6は1年のみ)
-    # 2年以上の先生が、月6に固定されていないかチェック
-    # (月6以外にも拡張できるように、汎用チェックを入れるとベストだが、まずは月6)
-    
-    # 教員の学年マップ
-    t_grade = {}
-    for _, r in df_teacher.iterrows():
-        try: t_grade[r['教員名']] = int(r['担当学年'])
-        except: t_grade[r['教員名']] = 0
-        
-    for _, r in df_const.iterrows():
-        t = r['対象（教員名orクラス）']
-        d = r['曜日']
-        p = str(r['限'])
-        
-        # 月曜6限チェック
-        if d == '月' and p == '6':
-            # 教員名指定の場合
-            if t in t_grade:
-                if t_grade[t] != 1 and t_grade[t] != 0:
-                    errors.append(f"🔴 矛盾: {t}先生({t_grade[t]}年)が「月曜6限」に固定されていますが、月6は1年生専用です。")
-            # 学年団指定の場合
-            elif "年団" in t:
-                try:
-                    g = int(t.replace("年団",""))
-                    if g != 1:
-                        errors.append(f"🔴 矛盾: 「{t}」が「月曜6限」に固定されていますが、月6は1年生専用です。")
-                except: pass
-
-    # 2. コマ数オーバーチェック
     # 教員ごとの持ちコマ数
     t_load = collections.defaultdict(int)
     for _, r in df_req.iterrows():
@@ -196,16 +166,27 @@ def check_data_conflicts(df_req, df_teacher, df_const):
     
     # 教員ごとの固定数
     t_fixed = collections.defaultdict(int)
+    t_grade = {}
+    for _, r in df_teacher.iterrows():
+        try: t_grade[r['教員名']] = int(r['担当学年'])
+        except: t_grade[r['教員名']] = 0
+
     for _, r in df_const.iterrows():
         t = r['対象（教員名orクラス）']
+        # 教員名指定
         if t in t_grade: t_fixed[t] += 1
+        # 学年団指定
+        elif "年団" in t:
+            try:
+                g = int(t.replace("年団",""))
+                # その学年の全教員に+1
+                for t_name, tg in t_grade.items():
+                    if tg == g: t_fixed[t_name] += 1
+            except: pass
         
-    # チェック
+    # 容量チェック
     for t, load in t_load.items():
         fixed = t_fixed.get(t, 0)
-        # 全コマ数 - 固定数
-        # 月〜金(29コマ) - 固定数 < 持ちコマ数 なら破綻
-        # (簡易計算)
         if 29 - fixed < load:
             errors.append(f"🔴 容量オーバー: {t}先生は週{load}コマ担当ですが、固定・会議等で空き枠が足りません。")
 
@@ -313,12 +294,7 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
                 for item in class_subjects[target]:
                     if (target, d, p, item['id']) in x: model.Add(x[(target, d, p, item['id'])] == 0)
     
-    # ★月6学年ブロック (ハードコーディング)
-    # 月曜6限は、担当学年が1(または0)以外の教員は授業不可
-    for t_name, t_grade in teacher_grade_map.items():
-        if t_grade != 1 and t_grade != 0:
-            if (t_name, '月', 6) in teacher_vars:
-                model.Add(sum(teacher_vars[(t_name, '月', 6)]) == 0)
+    # 月6ブロックのハードコードは削除しました
 
     for c in classes:
         for item in class_subjects[c]:
