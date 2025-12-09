@@ -153,18 +153,16 @@ def generate_excel(df_res, classes, teacher_data, df_const):
     wb.save(output)
     return output.getvalue()
 
-# ★★★ 診断関数 (余計なチェックを削除) ★★★
-def check_data_conflicts(df_req, df_teacher, df_const):
-    """データ矛盾の事前チェック"""
-    errors = []
-    
-    # 教員ごとの持ちコマ数
+# ★★★ 診断関数 (容量オーバー可視化) ★★★
+def check_capacity(df_req, df_teacher, df_const):
+    """教員の持ちコマ数と空きコマ数を計算してテーブルを返す"""
+    # 1. 授業コマ数の集計 (固定引き算前)
     t_load = collections.defaultdict(int)
     for _, r in df_req.iterrows():
         if pd.notna(r['担当教員']): t_load[r['担当教員']] += int(r['週コマ数'])
         if pd.notna(r['担当教員２']): t_load[r['担当教員２']] += int(r['週コマ数'])
     
-    # 教員ごとの固定数
+    # 2. 固定・会議コマ数の集計
     t_fixed = collections.defaultdict(int)
     t_grade = {}
     for _, r in df_teacher.iterrows():
@@ -173,24 +171,37 @@ def check_data_conflicts(df_req, df_teacher, df_const):
 
     for _, r in df_const.iterrows():
         t = r['対象（教員名orクラス）']
-        # 教員名指定
-        if t in t_grade: t_fixed[t] += 1
-        # 学年団指定
-        elif "年団" in t:
+        if t in t_grade: t_fixed[t] += 1 # 個人指定
+        elif "年団" in t: # 学年団指定
             try:
                 g = int(t.replace("年団",""))
-                # その学年の全教員に+1
                 for t_name, tg in t_grade.items():
                     if tg == g: t_fixed[t_name] += 1
             except: pass
+            
+    # 3. データフレーム作成
+    data = []
+    TOTAL_SLOTS = 29 # 月~金(6*4+5)
+    
+    for t_name in df_teacher['教員名']:
+        load = t_load.get(t_name, 0)
+        fixed = t_fixed.get(t_name, 0)
+        free = TOTAL_SLOTS - fixed
+        balance = free - load
         
-    # 容量チェック
-    for t, load in t_load.items():
-        fixed = t_fixed.get(t, 0)
-        if 29 - fixed < load:
-            errors.append(f"🔴 容量オーバー: {t}先生は週{load}コマ担当ですが、固定・会議等で空き枠が足りません。")
-
-    return errors
+        status = "✅ OK"
+        if balance < 0: status = "🔴 容量オーバー"
+        elif balance <= 2: status = "⚠️ 余裕なし"
+        
+        data.append({
+            "教員名": t_name,
+            "担当コマ数": load,
+            "固定・会議": fixed,
+            "残り枠": free,
+            "判定": status
+        })
+        
+    return pd.DataFrame(data)
 
 def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_classes, manual_instructions):
     # 1. データ整理
@@ -294,8 +305,6 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
                 for item in class_subjects[target]:
                     if (target, d, p, item['id']) in x: model.Add(x[(target, d, p, item['id'])] == 0)
     
-    # 月6ブロックのハードコードは削除しました
-
     for c in classes:
         for item in class_subjects[c]:
             model.Add(sum(x[(c, d, p, item['id'])] for d in days for p in periods[d]) == item['total_count'])
@@ -446,13 +455,6 @@ if f_req and f_teacher and f_const and f_conf:
     teachers = df_teacher['教員名'].tolist()
     classes = sorted(df_req['クラス'].unique().tolist())
     
-    # ★ 事前矛盾チェック ★
-    errors = check_data_conflicts(df_req, df_teacher, df_const)
-    if errors:
-        st.error("⚠️ データの矛盾が見つかりました。このままだと「解なし」になります。")
-        for e in errors:
-            st.write(e)
-    
     # 個別指示
     st.markdown("### 🗣️ 個別指示機能")
     if 'instructions' not in st.session_state:
@@ -523,6 +525,20 @@ if f_req and f_teacher and f_const and f_conf:
 
     st.divider()
     if st.button("🚀 作成開始 (再計算)", type="primary"):
+        # ★ 計算前に容量チェックを表示
+        st.subheader("📊 容量チェック (計算前診断)")
+        cap_df = check_capacity(df_req, df_teacher, df_const)
+        
+        # エラーがある人だけ赤く表示して目立たせる
+        error_rows = cap_df[cap_df['判定'].str.contains("🔴")]
+        if not error_rows.empty:
+            st.error("⚠️ 以下の先生のコマ数がパンクしています！このままでは解が見つかりません。")
+            st.dataframe(error_rows)
+        else:
+            st.success("✅ 教員のコマ数容量はOKです。")
+            with st.expander("詳細を見る"):
+                st.dataframe(cap_df)
+
         manual_list = [m for m in input_df.to_dict('records') if m['対象'] is not None]
         with st.spinner("計算中..."):
             weights = {'TEACHER_LOAD': w_load, 'AM_FULL_AVOID': w_am, 'STUDENT_5MAJORS': w_st5}
@@ -534,6 +550,6 @@ if f_req and f_teacher and f_const and f_conf:
                 st.success("作成完了！")
                 st.rerun()
             else:
-                st.error("解が見つかりませんでした。設定した「固定・禁止リスト」や「個別指示」に矛盾がないか確認してください。")
+                st.error("解が見つかりませんでした。上の「容量チェック」や固定リストを確認してください。")
 else:
     st.info("👈 左側のサイドバーからCSVファイル（4つ）をアップロードしてください。")
