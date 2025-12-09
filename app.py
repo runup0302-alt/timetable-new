@@ -29,19 +29,43 @@ st.set_page_config(layout="wide", page_title="中学校時間割システム")
 if "PASSWORD" in st.secrets:
     if not check_password(): st.stop()
 
-# --- 🛠️ ユーティリティ関数 ---
+# --- 🛠️ ユーティリティ関数 (強化版) ---
 
 def load_csv_safe(file):
-    """CSV読み込み (UTF-8 でダメなら Shift-JIS で再トライ)"""
+    """CSV読み込み (BOM付きUTF-8, Shift-JIS 対応 & 列名クリーニング)"""
     try:
-        return pd.read_csv(file)
+        # まずは utf-8-sig (ExcelのBOM付き対応)
+        df = pd.read_csv(file, encoding='utf-8-sig')
     except UnicodeDecodeError:
-        file.seek(0)
-        return pd.read_csv(file, encoding='cp932')
+        try:
+            # ダメなら cp932 (Windows標準)
+            file.seek(0)
+            df = pd.read_csv(file, encoding='cp932')
+        except:
+            # それでもダメなら utf-8
+            file.seek(0)
+            df = pd.read_csv(file, encoding='utf-8')
+    
+    # 列名のクリーニング (前後の空白削除)
+    df.columns = [c.strip() for c in df.columns]
+    return df
+
+def find_column(df, keywords):
+    """あいまいで列名を探す (例: '学年団拘束' がダメなら '学年' を含む列を探す)"""
+    # 完全一致チェック
+    for col in df.columns:
+        if col in keywords:
+            return col
+    # 部分一致チェック
+    for col in df.columns:
+        for k in keywords:
+            if k in col:
+                return col
+    return None
 
 def clean_bool(val):
     s = str(val).strip().upper()
-    return s in ['〇', 'TRUE', '1', 'YES', 'TRUE']
+    return s in ['〇', 'TRUE', '1', 'YES', 'TRUE', '○', 'ON'] # 丸記号の表記ゆれ対応
 
 def format_cell_text(class_name, subject_name):
     if subject_name in ['総合', '道徳', '学活', '自立']: return subject_name
@@ -139,22 +163,31 @@ def generate_excel(df_res, classes, teacher_data, df_const):
     return output.getvalue()
 
 def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_classes, manual_instructions):
-    # 1. 教員データの整理
+    # 1. データ整理
     teachers = df_teacher['教員名'].tolist()
     teacher_grade_map = dict(zip(df_teacher['教員名'], df_teacher['担当学年']))
     classes = sorted(df_req['クラス'].unique())
     days = ['月', '火', '水', '木', '金']
     periods = {'月': [1,2,3,4,5,6], '火': [1,2,3,4,5,6], '水': [1,2,3,4,5,6], '木': [1,2,3,4,5,6], '金': [1,2,3,4,5]}
 
-    # 2. 教科設定の整理
+    # 2. 教科設定の整理 (★ここを強化)
     subj_conf = {}
+    
+    # 列名の「ゆらぎ」を吸収して探す
+    col_continuous = find_column(df_subj_conf, ['連続コマ', '連続', '2コマ'])
+    col_block = find_column(df_subj_conf, ['学年団拘束', '学年拘束', '学年団', '拘束'])
+    
+    if not col_continuous or not col_block:
+        st.error(f"教科設定CSVの列名が見つかりません。現在の列名: {df_subj_conf.columns.tolist()}")
+        st.stop() # ここで止めてユーザーに知らせる
+
     for _, row in df_subj_conf.iterrows():
         subj_conf[row['教科']] = {
-            'continuous': clean_bool(row['連続コマ']),
-            'grade_block': clean_bool(row['学年団拘束'])
+            'continuous': clean_bool(row[col_continuous]),
+            'grade_block': clean_bool(row[col_block])
         }
 
-    # 3. 必要コマ数の調整
+    # 3. 必要コマ数調整
     fixed_counts = collections.defaultdict(int)
     for _, row in df_const.iterrows():
         tgt = row['対象（教員名orクラス）']; content = row['内容']
@@ -254,8 +287,7 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
                         start_vars.append(s_var)
                         model.Add(x[(c, d, s, item['id'])] == 1).OnlyEnforceIf(s_var)
                         model.Add(x[(c, d, s+1, item['id'])] == 1).OnlyEnforceIf(s_var)
-                    day_slots = [x[(c, d, p, item['id'])] for p in periods[d]]
-                    # 簡易実装
+                    # day_slots = [x[(c, d, p, item['id'])] for p in periods[d]]
 
     # 個別指示
     if manual_instructions:
@@ -359,11 +391,19 @@ recalc_list = [x.strip() for x in recalc_str.split(',')] if recalc_str else []
 st.title("🏫 中学校時間割 AI作成システム (完全汎用版)")
 
 if f_req and f_teacher and f_const and f_conf:
+    # 読み込み (安全策)
     df_req = load_csv_safe(f_req)
     df_teacher = load_csv_safe(f_teacher)
     df_const = load_csv_safe(f_const)
     df_conf = load_csv_safe(f_conf)
     
+    # 診断: 列名のチェック
+    st.markdown("---")
+    with st.expander("🔍 デバッグ情報 (CSV読み込み状況)"):
+        st.write("教員データ:", df_teacher.columns.tolist())
+        st.write("教科設定:", df_conf.columns.tolist())
+        st.write("固定リスト:", df_const.columns.tolist())
+
     # 教員を「表示順」でソート
     if '表示順' in df_teacher.columns:
         df_teacher = df_teacher.sort_values('表示順')
@@ -418,7 +458,6 @@ if f_req and f_teacher and f_const and f_conf:
         
         for _, cr in df_const.iterrows():
             t = cr['対象（教員名orクラス）']
-            # 学年団対応
             targets = []
             if "年団" in t:
                 try:
