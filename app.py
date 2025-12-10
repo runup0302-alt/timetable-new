@@ -1,181 +1,195 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from ortools.sat.python import cp_model
+import openpyxl
+from openpyxl.styles import Alignment, Border, Side, Font, PatternFill
+from openpyxl.utils import get_column_letter
 import io
+import collections
 
-# ==========================================
-# 設定・定数
-# ==========================================
-st.set_page_config(page_title="時間割作成システム", layout="wide")
+# --- 🔐 セキュリティ設定 ---
+def check_password():
+    """パスワード認証機能"""
+    if "password_correct" not in st.session_state:
+        st.session_state.password_correct = False
 
-# 表記ゆれ吸収辞書
+    if st.session_state.password_correct:
+        return True
+
+    st.markdown("## 🔒 時間割作成システム ログイン")
+    password = st.text_input("パスワードを入力してください", type="password")
+    
+    if st.button("ログイン"):
+        # secretsが設定されていない場合（ローカル等）のための回避策
+        correct_password = st.secrets["PASSWORD"] if "PASSWORD" in st.secrets else "1234"
+        
+        if password == correct_password:
+            st.session_state.password_correct = True
+            st.rerun()
+        else:
+            st.error("パスワードが違います")
+    return False
+
+# --- ⚙️ 定数・設定 ---
+st.set_page_config(layout="wide", page_title="中学校時間割システム")
+
+# パスワードチェック
+if not check_password():
+    st.stop()
+
+# --- 🛠️ ヘルパー関数群 ---
 NAME_CORRECTIONS = {
     "ニシダ": "ニシタ",
     "オオシマ": "オシマ",
-    # 必要に応じて追加
 }
 
 def clean_name(name):
     """名前の空白除去と表記ゆれ補正"""
     if pd.isna(name) or name == "":
         return ""
-    # 全角・半角スペース除去
     name = str(name).replace(" ", "").replace("　", "")
     return NAME_CORRECTIONS.get(name, name)
 
-# ==========================================
-# メインアプリ処理
-# ==========================================
-def main():
-    st.title("🏫 中学校 時間割作成システム (Streamlit版)")
-    st.markdown("""
-    **手順:**
-    1. 左側のサイドバーから必要なCSVファイルを5つアップロードしてください。
-    2. 「作成開始」ボタンを押してください。
-    3. 完成したExcelファイルをダウンロードできます。
-    """)
+def find_col(df, keywords):
+    """列名をあいまい検索"""
+    for col in df.columns:
+        for kw in keywords:
+            if kw in col:
+                return col
+    return None
 
-    # --- サイドバー：ファイルアップロード ---
-    st.sidebar.header("📂 データアップロード")
+def format_cell_text(class_name, subject_name):
+    """Excelセル内の表記短縮"""
+    if subject_name in ['総合', '道徳', '学活']: return subject_name
+    short_class = class_name.replace('-', '')
+    if '音美' in subject_name: return f"★{short_class}"
+    return short_class
+
+# --- 📊 Excel生成ロジック (ご希望のフォーマット) ---
+def generate_excel(df_res, classes, teachers, df_const):
+    output = io.BytesIO()
+    wb = openpyxl.Workbook()
     
-    file_teacher = st.sidebar.file_uploader("教員データ", type=["csv"])
-    file_subject = st.sidebar.file_uploader("教科設定 - 年間", type=["csv"])
-    file_req = st.sidebar.file_uploader("授業データ (前期or後期)", type=["csv"])
-    file_fixed = st.sidebar.file_uploader("固定・禁止リスト (前期or後期)", type=["csv"])
+    # スタイル定義
+    thick = Side(style='thick'); medium = Side(style='medium'); thin = Side(style='thin'); hair = Side(style='hair')
+    align_center = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
     
-    # 実行ボタン
-    if st.sidebar.button("🚀 作成開始"):
-        if not all([file_teacher, file_subject, file_req]): 
-            st.error("⚠️ 必須ファイル（教員、教科、授業）が不足しています。")
-            return
+    # ---------------------------------------------------------
+    # シート1: クラス別 (横にクラス、縦に時間)
+    # ---------------------------------------------------------
+    ws_c = wb.active
+    ws_c.title = "クラス別"
+    
+    # ヘッダー作成
+    ws_c.cell(row=1, column=1, value="曜").fill = header_fill
+    ws_c.cell(row=1, column=2, value="限").fill = header_fill
+    
+    for i, c in enumerate(classes):
+        col = 3 + i
+        cell = ws_c.cell(row=1, column=col, value=c)
+        cell.fill = header_fill
+        cell.alignment = align_center
+        ws_c.column_dimensions[get_column_letter(col)].width = 12
 
-        with st.spinner("⏳ 最適化計算を実行中..."):
-            try:
-                # --------------------------------------
-                # 1. データ読み込み処理
-                # --------------------------------------
+    days = ['月', '火', '水', '木', '金']
+    curr = 2
+    for d in days:
+        periods = [1,2,3,4,5,6] if d != '金' else [1,2,3,4,5]
+        max_p = periods[-1]
+        for p in periods:
+            # 罫線設定
+            top = thick if p==1 else (medium if p==5 else thin)
+            bottom = thick if p==max_p else (medium if p==4 else thin)
+            
+            # 曜日・限
+            c_day = ws_c.cell(row=curr, column=1, value=d if p==1 else "")
+            c_day.border = Border(top=top, bottom=bottom, left=thick, right=thin)
+            c_day.alignment = align_center
+            
+            c_p = ws_c.cell(row=curr, column=2, value=p)
+            c_p.border = Border(top=top, bottom=bottom, left=thin, right=thin)
+            c_p.alignment = align_center
+            
+            # データ埋め込み
+            for i, c in enumerate(classes):
+                cell = ws_c.cell(row=curr, column=3+i)
+                cell.border = Border(top=top, bottom=bottom, left=thin, right=thin)
+                cell.alignment = align_center
                 
-                # (1) 教員データ
-                df_teacher = pd.read_csv(file_teacher)
-                df_teacher['教員名'] = df_teacher['教員名'].apply(clean_name)
-                teachers = df_teacher['教員名'].unique().tolist()
-                
-                # (2) 教科設定（連続フラグの取得）
-                df_subj = pd.read_csv(file_subject)
-                # 列名の空白削除
-                df_subj.columns = [c.strip() for c in df_subj.columns]
+                # 該当する授業を探す
+                matches = df_res[(df_res['曜日']==d) & (df_res['限']==p) & (df_res['クラス']==c)]
+                if not matches.empty:
+                    r = matches.iloc[0]
+                    # 表示形式: 教科(改行)教員名
+                    txt = f"{r['教科']}\n{r['教員']}"
+                    cell.value = txt
+                    cell.font = Font(size=9)
+            curr += 1
 
-                continuous_flags = {}
-                
-                # 【修正】列名自動検出ロジック
-                # 「教科」または「教科名」が含まれる列を探す
-                col_subj_name = None
-                col_cont = None
-                
-                for c in df_subj.columns:
-                    if "教科" in c:  # "教科" or "教科名"
-                        col_subj_name = c
-                    if "連続" in c:
-                        col_cont = c
-                
-                if not col_subj_name:
-                    st.error("エラー: 教科設定ファイルに『教科』または『教科名』の列が見つかりません。")
-                    return
+    # ---------------------------------------------------------
+    # シート2: 教員別 (横に教員、縦に時間)
+    # ---------------------------------------------------------
+    ws_t = wb.create_sheet(title="教員別")
+    
+    ws_t.cell(row=1, column=1, value="曜").fill = header_fill
+    ws_t.cell(row=1, column=2, value="限").fill = header_fill
+    
+    for i, t in enumerate(teachers):
+        col = 3 + i
+        cell = ws_t.cell(row=1, column=col, value=t)
+        cell.fill = header_fill
+        cell.alignment = align_center
+        ws_t.column_dimensions[get_column_letter(col)].width = 6
 
-                # 設定読み込み
-                for _, row in df_subj.iterrows():
-                    s_name = str(row[col_subj_name]).strip()
-                    
-                    # 連続列がある場合のみ判定、なければFalse
-                    is_cont_flag = False
-                    if col_cont:
-                        val = str(row[col_cont])
-                        if "〇" in val or "TRUE" in val.upper():
-                            is_cont_flag = True
-                    
-                    continuous_flags[s_name] = is_cont_flag
+    curr = 2
+    for d in days:
+        periods = [1,2,3,4,5,6] if d != '金' else [1,2,3,4,5]
+        max_p = periods[-1]
+        for p in periods:
+            top = thick if p==1 else (medium if p==5 else thin)
+            bottom = thick if p==max_p else (medium if p==4 else thin)
+            
+            ws_t.cell(row=curr, column=1, value=d if p==1 else "").border = Border(top=top, bottom=bottom, left=thick, right=thin)
+            ws_t.cell(row=curr, column=2, value=p).border = Border(top=top, bottom=bottom, left=thin, right=thin)
+            
+            for i, t in enumerate(teachers):
+                cell = ws_t.cell(row=curr, column=3+i)
+                cell.border = Border(top=top, bottom=bottom, left=hair, right=hair)
+                cell.alignment = align_center
                 
-                # (3) 授業データ
-                df_req = pd.read_csv(file_req)
-                df_req.columns = [c.strip() for c in df_req.columns]
-                
-                req_list = []
-                req_id = 0
-                for _, row in df_req.iterrows():
-                    cls = str(row['クラス']).strip()
-                    subj = str(row['教科']).strip()
-                    t1 = clean_name(row['担当教員'])
-                    t2 = clean_name(row.get('担当教員２', '')) 
-                    num = int(row['週コマ数'])
-                    
-                    if num > 0:
-                        # 連続判定: 設定ファイルでTrue かつ 週2コマ以上
-                        # (技術家庭科の週1コマはここでFalseになる)
-                        is_cont = continuous_flags.get(subj, False)
-                        if num < 2:
-                            is_cont = False 
-                        
-                        req_list.append({
-                            'id': req_id,
-                            'class': cls,
-                            'subject': subj,
-                            't1': t1,
-                            't2': t2,
-                            'num': num,
-                            'continuous': is_cont
-                        })
-                        req_id += 1
-
-                # (4) 固定・禁止リスト
-                fixed_list = []
-                if file_fixed:
-                    df_fix = pd.read_csv(file_fixed)
-                    # 列名クリーニング
-                    df_fix.columns = [c.strip() for c in df_fix.columns]
-                    
-                    for _, row in df_fix.iterrows():
-                        target = clean_name(row['対象'])
-                        day_str = row['曜日']
-                        period = int(row['限'])
-                        content = row['内容']
-                        
-                        w_map = {'月':0, '火':1, '水':2, '木':3, '金':4}
-                        if day_str in w_map:
-                            fixed_list.append({
-                                'target': target,
-                                'day': w_map[day_str],
-                                'period': period,
-                                'content': content
-                            })
-
-                # --------------------------------------
-                # 2. 最適化実行
-                # --------------------------------------
-                result_file = solve_schedule(teachers, req_list, fixed_list)
-                
-                if result_file:
-                    st.success("🎉 時間割が完成しました！")
-                    st.download_button(
-                        label="📥 Excelをダウンロード",
-                        data=result_file,
-                        file_name="完成時間割.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                # 授業検索
+                matches = df_res[(df_res['曜日']==d) & (df_res['限']==p) & (df_res['教員'].str.contains(t, na=False))]
+                val = ""
+                if not matches.empty:
+                    r = matches.iloc[0]
+                    val = format_cell_text(r['クラス'], r['教科'])
                 else:
-                    st.error("❌ 解が見つかりませんでした。条件を緩和してください。")
+                    # 固定リスト(部会など)検索
+                    # df_constは標準化済みと仮定
+                    for fix in df_const:
+                        if fix['target'] == t and fix['day'] == {'月':0,'火':1,'水':2,'木':3,'金':4}[d] and fix['period'] == p:
+                            val = f"【{fix['content']}】"
+                            break
+                            
+                cell.value = val
+                if val: cell.font = Font(size=11)
+            curr += 1
 
-            except Exception as e:
-                st.error(f"エラー詳細: {e}")
+    wb.save(output)
+    return output.getvalue()
 
-# ==========================================
-# ソルバーロジック
-# ==========================================
+
+# --- 🧩 最適化ロジック (修正版) ---
 def solve_schedule(teachers, req_list, fixed_list):
     model = cp_model.CpModel()
     DAYS = 5
+    
+    # 変数 X[req_id, day, period]
     X = {}
     
-    # 1. 変数作成
+    # 1. 授業配置
     for r in req_list:
         rid = r['id']
         slots = []
@@ -186,15 +200,13 @@ def solve_schedule(teachers, req_list, fixed_list):
                 slots.append(X[(rid, d, p)])
         model.Add(sum(slots) == r['num'])
         
-        # 連続制約
+        # 連続制約 (今日の修正点)
         if r['continuous'] and r['num'] == 2:
             pair_vars = []
             for d in range(DAYS):
                 p_max = 5 if d == 4 else 6
-                # 昼休み(4-5)跨ぎNG
                 pairs = [(1,2), (2,3), (3,4)]
                 if p_max >= 6: pairs.append((5,6))
-                
                 for (p1, p2) in pairs:
                     b_pair = model.NewBoolVar(f'pair_{rid}_{d}_{p1}')
                     model.Add(X[(rid, d, p1)] + X[(rid, d, p2)] == 2).OnlyEnforceIf(b_pair)
@@ -202,7 +214,7 @@ def solve_schedule(teachers, req_list, fixed_list):
                     pair_vars.append(b_pair)
             model.Add(sum(pair_vars) >= 1)
 
-    # 2. クラス重複
+    # 2. クラス重複禁止
     classes = sorted(list(set(r['class'] for r in req_list)))
     for cls in classes:
         cls_reqs = [r for r in req_list if r['class'] == cls]
@@ -220,28 +232,23 @@ def solve_schedule(teachers, req_list, fixed_list):
         if r['t2'] in teachers: t_map[r['t2']].append(r)
     
     for t in teachers:
-        # 固定リスト
+        # 固定リスト適用
         for fix in fixed_list:
             if fix['target'] == t:
                 d, p = fix['day'], fix['period']
-                vars_here = []
-                for r in t_map[t]:
-                    if (r['id'], d, p) in X:
-                        vars_here.append(X[(r['id'], d, p)])
+                vars_here = [X[(r['id'], d, p)] for r in t_map[t] if (r['id'], d, p) in X]
                 if vars_here:
                     model.Add(sum(vars_here) == 0)
-        # 重複
+        
+        # 重複禁止
         for d in range(DAYS):
             p_max = 5 if d == 4 else 6
             for p in range(1, p_max + 1):
-                vars_here = []
-                for r in t_map[t]:
-                    if (r['id'], d, p) in X:
-                        vars_here.append(X[(r['id'], d, p)])
+                vars_here = [X[(r['id'], d, p)] for r in t_map[t] if (r['id'], d, p) in X]
                 if vars_here:
                     model.Add(sum(vars_here) <= 1)
 
-    # 4. 同学年排他
+    # 4. 学年排他（体育など）
     grade_reqs = {}
     for r in req_list:
         g = r['class'].split('-')[0]
@@ -259,7 +266,7 @@ def solve_schedule(teachers, req_list, fixed_list):
                     if vars_here:
                         model.Add(sum(vars_here) <= 1)
 
-    # 目的関数
+    # 目的関数 (授業をなるべく前に)
     obj_terms = []
     for (rid, d, p), var in X.items():
         obj_terms.append(var * p)
@@ -270,66 +277,142 @@ def solve_schedule(teachers, req_list, fixed_list):
     status = solver.Solve(model)
 
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-        return generate_excel(solver, X, req_list, teachers, fixed_list)
+        # 結果をDataFrame化して返す
+        recs = []
+        days_map = {0:'月', 1:'火', 2:'水', 3:'木', 4:'金'}
+        for r in req_list:
+            rid = r['id']
+            for d in range(DAYS):
+                p_max = 5 if d == 4 else 6
+                for p in range(1, p_max + 1):
+                    if (rid, d, p) in X and solver.Value(X[(rid, d, p)]) == 1:
+                        t_str = r['t1']
+                        if r['t2']: t_str += f", {r['t2']}"
+                        recs.append({
+                            '曜日': days_map[d],
+                            '限': p,
+                            'クラス': r['class'],
+                            '教科': r['subject'],
+                            '教員': t_str
+                        })
+        return pd.DataFrame(recs)
     else:
         return None
 
-def generate_excel(solver, X, req_list, teachers, fixed_list):
-    output = io.BytesIO()
-    days = ['月', '火', '水', '木', '金']
-    
-    data_cls = {}
-    data_tch = {}
-    
-    for fix in fixed_list:
-        t = fix['target']
-        data_tch[(t, fix['day'], fix['period'])] = f"【{fix['content']}】"
+# --- 📱 メインアプリ画面 ---
+st.title("🏫 中学校 時間割作成システム")
 
-    for r in req_list:
-        rid = r['id']
-        for d in range(5):
-            p_max = 5 if d == 4 else 6
-            for p in range(1, p_max + 1):
-                if (rid, d, p) in X and solver.Value(X[(rid, d, p)]) == 1:
-                    txt_c = f"{r['subject']}\n{r['t1']}"
-                    if r['t2']: txt_c += f"/{r['t2']}"
-                    data_cls[(r['class'], d, p)] = txt_c
+st.sidebar.header("1. データアップロード")
+# keyを指定してリロード時の挙動を安定化
+f_teacher = st.sidebar.file_uploader("教員データ", type='csv', key="up_t")
+f_subject = st.sidebar.file_uploader("教科設定", type='csv', key="up_s")
+f_req = st.sidebar.file_uploader("授業データ", type='csv', key="up_r")
+f_fixed = st.sidebar.file_uploader("固定・禁止リスト", type='csv', key="up_f")
+
+if st.sidebar.button("🚀 作成開始"):
+    if not all([f_teacher, f_subject, f_req]):
+        st.error("⚠️ 必須ファイル（教員、教科、授業）が不足しています。")
+    else:
+        with st.spinner("データの読み込みと診断中..."):
+            try:
+                # --- データ読み込み (Shift-JIS/UTF-8自動対応 & 列名検索) ---
+                
+                # 1. 教員
+                df_teacher = pd.read_csv(f_teacher, encoding='utf-8-sig')
+                c_name = find_col(df_teacher, ['教員名', '氏名', '名前'])
+                if not c_name: raise ValueError("教員データに名前の列が見つかりません")
+                df_teacher['教員名'] = df_teacher[c_name].apply(clean_name)
+                teachers = df_teacher['教員名'].unique().tolist()
+                
+                # 2. 教科設定
+                df_subj = pd.read_csv(f_subject, encoding='utf-8-sig')
+                c_sname = find_col(df_subj, ['教科名', '教科'])
+                c_cont = find_col(df_subj, ['連続'])
+                continuous_flags = {}
+                if c_sname:
+                    for _, row in df_subj.iterrows():
+                        s_name = str(row[c_sname]).strip()
+                        is_cont = False
+                        if c_cont:
+                            val = str(row[c_cont])
+                            if "〇" in val or "TRUE" in val.upper():
+                                is_cont = True
+                        continuous_flags[s_name] = is_cont
+                
+                # 3. 授業データ
+                df_req = pd.read_csv(f_req, encoding='utf-8-sig')
+                c_cls = find_col(df_req, ['クラス'])
+                c_sub = find_col(df_req, ['教科'])
+                c_t1 = find_col(df_req, ['担当教員', '教員1'])
+                c_num = find_col(df_req, ['週コマ', '数'])
+                c_t2 = find_col(df_req, ['担当教員2', '教員2', 'Ｔ２'])
+                
+                if not (c_cls and c_sub and c_t1 and c_num):
+                    raise ValueError("授業データに必要な列（クラス、教科、担当教員、週コマ数）が不足しています")
+                
+                req_list = []
+                req_id = 0
+                for _, row in df_req.iterrows():
+                    cls = str(row[c_cls]).strip()
+                    subj = str(row[c_sub]).strip()
+                    t1 = clean_name(row[c_t1])
+                    t2 = clean_name(row[c_t2]) if c_t2 else ""
+                    try: num = int(row[c_num])
+                    except: continue
                     
-                    txt_t = f"{r['class']} {r['subject']}"
-                    data_tch[(r['t1'], d, p)] = txt_t
-                    if r['t2']: data_tch[(r['t2'], d, p)] = txt_t
+                    if num > 0:
+                        # ★ 修正ポイント: 技術家庭科週1コマなら連続させない
+                        is_cont = continuous_flags.get(subj, False)
+                        if num < 2: is_cont = False
+                        
+                        req_list.append({
+                            'id': req_id, 'class': cls, 'subject': subj,
+                            't1': t1, 't2': t2, 'num': num, 'continuous': is_cont
+                        })
+                        req_id += 1
 
-    rows_c = []
-    all_classes = sorted(list(set(r['class'] for r in req_list)))
-    for c in all_classes:
-        for p in range(1, 7):
-            row = {'クラス': c, '限': p}
-            for di, dw in enumerate(days):
-                if di == 4 and p == 6: row[dw] = ""
-                else: row[dw] = data_cls.get((c, di, p), "")
-            rows_c.append(row)
-    df_c = pd.DataFrame(rows_c)
+                # 4. 固定リスト
+                fixed_list = []
+                if f_fixed:
+                    df_fix = pd.read_csv(f_fixed, encoding='utf-8-sig')
+                    c_tar = find_col(df_fix, ['対象', '教員'])
+                    c_day = find_col(df_fix, ['曜日'])
+                    c_per = find_col(df_fix, ['限'])
+                    c_con = find_col(df_fix, ['内容'])
+                    
+                    if c_tar and c_day and c_per:
+                        for _, row in df_fix.iterrows():
+                            target = clean_name(row[c_tar])
+                            day_str = row[c_day]
+                            try: p = int(row[c_per])
+                            except: p = 0
+                            content = row[c_con] if c_con else "用務"
+                            
+                            w_map = {'月':0, '火':1, '水':2, '木':3, '金':4}
+                            if day_str in w_map and p > 0:
+                                fixed_list.append({
+                                    'target': target,
+                                    'day': w_map[day_str],
+                                    'period': p,
+                                    'content': content
+                                })
 
-    rows_t = []
-    for t in teachers:
-        for p in range(1, 7):
-            row = {'教員名': t, '限': p}
-            for di, dw in enumerate(days):
-                if di == 4 and p == 6: row[dw] = ""
-                else: row[dw] = data_tch.get((t, di, p), "")
-            rows_t.append(row)
-    df_t = pd.DataFrame(rows_t)
-
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df_c.to_excel(writer, sheet_name='クラス別', index=False)
-        df_t.to_excel(writer, sheet_name='教員別', index=False)
-        wb = writer.book
-        fmt = wb.add_format({'text_wrap': True, 'valign': 'top'})
-        for ws in writer.sheets.values():
-            ws.set_column('A:G', 15, fmt)
-
-    output.seek(0)
-    return output
-
-if __name__ == "__main__":
-    main()
+                # 計算実行
+                st.info("計算を開始します...")
+                df_result = solve_schedule(teachers, req_list, fixed_list)
+                
+                if df_result is not None:
+                    st.success("🎉 時間割が完成しました！")
+                    excel_data = generate_excel(df_result, sorted(list(set(r['class'] for r in req_list))), teachers, fixed_list)
+                    
+                    st.download_button(
+                        label="📥 完成したExcelをダウンロード",
+                        data=excel_data,
+                        file_name="時間割_完成.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                else:
+                    st.error("❌ 解が見つかりませんでした。条件を緩和してください。")
+                    
+            except Exception as e:
+                st.error(f"エラーが発生しました: {e}")
