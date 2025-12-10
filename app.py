@@ -41,10 +41,7 @@ def load_csv_safe(file):
         except:
             file.seek(0)
             df = pd.read_csv(file, encoding='utf-8')
-    df.columns = [str(c).strip().replace('　', '') for c in df.columns]
-    for col in df.columns:
-        if df[col].dtype == object:
-            df[col] = df[col].astype(str).str.strip().str.replace('　', '')
+    df.columns = [str(c).strip() for c in df.columns]
     return df
 
 def find_column(df, keywords):
@@ -110,7 +107,12 @@ def generate_excel(df_res, classes, teacher_data, df_const):
                 cell = ws_t.cell(row=curr, column=3+i)
                 cell.border = Border(top=top, bottom=bottom, left=hair, right=hair)
                 cell.alignment = align_center
-                matches = df_res[(df_res['曜日']==d) & (df_res['限']==p) & (df_res['教員'].str.contains(t, na=False))]
+                
+                # ★修正箇所: df_resが空でもエラーにならないように
+                matches = pd.DataFrame()
+                if not df_res.empty:
+                    matches = df_res[(df_res['曜日']==d) & (df_res['限']==p) & (df_res['教員'].str.contains(t, na=False))]
+                
                 val = ""
                 if not matches.empty:
                     r = matches.iloc[0]; val = format_cell_text(r['クラス'], r['教科'])
@@ -118,18 +120,18 @@ def generate_excel(df_res, classes, teacher_data, df_const):
                     for _, cr in df_const.iterrows():
                         target = cr['対象（教員名orクラス）']
                         
-                        # 固定表示のマッチングロジック (ここも強化)
                         is_match = False
                         if target == t: is_match = True
                         elif target in ["全員", "全教員"]: is_match = True
                         elif target == "全学年担任":
-                            role = teacher_data[teacher_data['教員名']==t]['役割'].values[0]
-                            if role == "担任": is_match = True
+                            # teacher_dataから役割を取得
+                            roles = teacher_data[teacher_data['教員名']==t]['役割']
+                            if not roles.empty and roles.values[0] == "担任": is_match = True
                         elif "年団" in target:
                             try:
                                 tg = int(target.replace("年団",""))
-                                my_g = teacher_data[teacher_data['教員名']==t]['担当学年'].values[0]
-                                if my_g == tg: is_match = True
+                                my_gs = teacher_data[teacher_data['教員名']==t]['担当学年']
+                                if not my_gs.empty and int(my_gs.values[0]) == tg: is_match = True
                             except: pass
                         
                         if is_match and cr['曜日'] == d and cr['限'] == p:
@@ -156,15 +158,17 @@ def generate_excel(df_res, classes, teacher_data, df_const):
             for i, c in enumerate(classes_s):
                 cell = ws_c.cell(row=curr, column=3+i)
                 cell.border = Border(top=top, bottom=bottom, left=thin, right=thin); cell.alignment = align_center
-                matches = df_res[(df_res['曜日']==d) & (df_res['限']==p) & (df_res['クラス']==c)]
-                if not matches.empty:
-                    r = matches.iloc[0]; cell.value = f"{r['教科']}\n({r['教員']})"
-                    cell.font = Font(size=9); cell.alignment = Alignment(wrap_text=True, horizontal='center', vertical='center')
+                
+                if not df_res.empty:
+                    matches = df_res[(df_res['曜日']==d) & (df_res['限']==p) & (df_res['クラス']==c)]
+                    if not matches.empty:
+                        r = matches.iloc[0]; cell.value = f"{r['教科']}\n({r['教員']})"
+                        cell.font = Font(size=9); cell.alignment = Alignment(wrap_text=True, horizontal='center', vertical='center')
             curr += 1
     wb.save(output)
     return output.getvalue()
 
-# ★★★ ターゲット展開ロジック (重要) ★★★
+# ★★★ ターゲット展開ロジック ★★★
 def expand_targets(target_str, df_teacher):
     """'全学年担任' などを具体的な教員名のリストに変換"""
     all_teachers = df_teacher['教員名'].tolist()
@@ -188,7 +192,7 @@ def expand_targets(target_str, df_teacher):
     if target_str in all_teachers:
         return [target_str]
         
-    return [] # クラス名または不明な場合は空リスト
+    return [] 
 
 # --- 診断関数 ---
 def check_data_integrity(df_req, df_teacher, df_const):
@@ -196,7 +200,6 @@ def check_data_integrity(df_req, df_teacher, df_const):
     master_teachers = set(df_teacher['教員名'].unique())
     master_classes = set(df_req['クラス'].unique())
     
-    # 特殊キーワード
     special_keywords = ["全員", "全教員", "全学年担任"]
     
     for t in df_const['対象（教員名orクラス）'].dropna().unique():
@@ -213,10 +216,7 @@ def check_structural_conflicts(df_req, df_teacher, df_const, df_conf):
     
     for _, r in df_const.iterrows():
         t_target = r['対象（教員名orクラス）']; d = r['曜日']; p = int(r['限'])
-        
-        # ターゲット展開
         targets = expand_targets(t_target, df_teacher)
-        
         for t in targets:
             if (d, p) in t_sched[t]:
                 errors.append(f"🔴 ダブルブッキング: {t}先生の {d}曜{p}限 に複数の固定が入っています。")
@@ -313,18 +313,16 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
                     if pd.notna(t2): teacher_vars[(t2, d, p)].append(var)
     for key, vars_list in teacher_vars.items(): model.Add(sum(vars_list) <= 1)
 
-    # 固定禁止 (キーワード展開対応)
+    # 固定禁止 (キーワード展開)
     for _, row in df_const.iterrows():
         target = row['対象（教員名orクラス）']; d = row['曜日']; content = row['内容']
         try: p = int(row['限'])
         except: continue
         
-        # A. 教員(展開後)
         targets = expand_targets(target, df_teacher)
         for t in targets:
             if (t, d, p) in teacher_vars: model.Add(sum(teacher_vars[(t, d, p)]) == 0)
         
-        # B. クラス指定
         if target in classes:
             found_subj = False
             for item in class_subjects[target]:
@@ -370,9 +368,41 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
                         model.Add(x[(c, d, s, item['id'])] == 1).OnlyEnforceIf(s_var)
                         model.Add(x[(c, d, s+1, item['id'])] == 1).OnlyEnforceIf(s_var)
 
-    # 個別指示 (簡略化)
+    # 個別指示
     if manual_instructions:
-        pass # 前述のロジックと同様に実装可能
+        for inst in manual_instructions:
+            target = inst.get('対象'); i_type = inst.get('指示タイプ'); day = inst.get('曜日'); val = inst.get('値')
+            if not target: continue
+            if target in teachers:
+                target_days = [day] if day in days else days
+                if i_type == '1日の最大コマ数':
+                    try: limit = int(val)
+                    except: continue
+                    for d_target in target_days:
+                        d_vars = []
+                        for p in periods[d_target]:
+                            if (target, d_target, p) in teacher_vars: d_vars.extend(teacher_vars[(target, d_target, p)])
+                        model.Add(sum(d_vars) <= limit)
+                elif i_type == '午前の授業数':
+                    try: limit = int(val)
+                    except: continue
+                    for d_target in target_days:
+                        am_vars = []
+                        for p in [1,2,3,4]:
+                            if (target, d_target, p) in teacher_vars: am_vars.extend(teacher_vars[(target, d_target, p)])
+                        model.Add(sum(am_vars) == limit)
+            elif target in classes:
+                subj_name = inst.get('教科')
+                if not subj_name: continue
+                if i_type == '優先配置' and val == '午前':
+                    for item in class_subjects[target]:
+                        if item['subj'] == subj_name:
+                            for d_loop in days:
+                                pm_slots = []
+                                for p in [5, 6]:
+                                    if p in periods[d_loop] and (target, d_loop, p, item['id']) in x:
+                                        pm_slots.append(x[(target, d_loop, p, item['id'])])
+                                if pm_slots: model.Add(sum(pm_slots) == 0)
 
     # ロック
     if 'prev_schedule' in st.session_state and recalc_classes:
@@ -406,6 +436,7 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
     solver.parameters.max_time_in_seconds = 60
     status = solver.Solve(model)
 
+    # ★修正箇所: 戻り値をDataFrameとして定義(列名付与)★
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         recs = []
         for c in classes:
@@ -416,7 +447,10 @@ def solve_schedule(df_req, df_teacher, df_const, df_subj_conf, weights, recalc_c
                             t_str = str(item['t1'])
                             if pd.notna(item['t2']): t_str += f", {item['t2']}"
                             recs.append({'曜日': d, '限': p, 'クラス': c, '教科': item['subj'], '教員': t_str})
-        return pd.DataFrame(recs)
+        
+        # DataFrameのカラムを明示
+        cols = ['曜日', '限', 'クラス', '教科', '教員']
+        return pd.DataFrame(recs, columns=cols)
     else:
         return None
 
@@ -426,7 +460,7 @@ st.sidebar.markdown("### 1. データ読み込み")
 f_req = st.sidebar.file_uploader("授業データ", type='csv')
 f_teacher = st.sidebar.file_uploader("教員データ", type='csv')
 f_const = st.sidebar.file_uploader("固定・禁止リスト", type='csv')
-f_conf = st.sidebar.file_uploader("教科設定 (New!)", type='csv')
+f_conf = st.sidebar.file_uploader("教科設定", type='csv')
 
 # 強制モード
 force_mode = st.sidebar.checkbox("🔥 強制作成モード (ルールを無視して強行)")
@@ -448,7 +482,6 @@ if f_req and f_teacher and f_const and f_conf:
     df_const = load_csv_safe(f_const)
     df_conf = load_csv_safe(f_conf)
     
-    # データクリーニング
     df_teacher['担当学年'] = pd.to_numeric(df_teacher['担当学年'], errors='coerce').fillna(0).astype(int)
     if '表示順' in df_teacher.columns:
         df_teacher['表示順'] = pd.to_numeric(df_teacher['表示順'], errors='coerce').fillna(999)
@@ -457,7 +490,6 @@ if f_req and f_teacher and f_const and f_conf:
     teachers = df_teacher['教員名'].tolist()
     classes = sorted(df_req['クラス'].unique().tolist())
     
-    # 診断
     st.markdown("---")
     st.subheader("🔍 データ矛盾診断")
     
@@ -486,7 +518,6 @@ if f_req and f_teacher and f_const and f_conf:
     
     st.markdown("---")
 
-    # 個別指示
     st.markdown("### 🗣️ 個別指示機能")
     if 'instructions' not in st.session_state:
         st.session_state['instructions'] = pd.DataFrame(columns=['対象', '曜日', '教科', '指示タイプ', '値'])
@@ -523,20 +554,19 @@ if f_req and f_teacher and f_const and f_conf:
                 view_data.append(row)
         df_view = pd.DataFrame(view_data)
         
-        for _, r in res_df.iterrows():
-            t_s = r['教員'].split(', ')
-            val = format_cell_text(r['クラス'], r['教科'])
-            for t in t_s:
-                target_col = [c for c in view_cols if c.startswith(t + " ")]
-                if target_col:
-                    mask = (df_view['曜日']==r['曜日']) & (df_view['限']==r['限'])
-                    df_view.loc[mask, target_col[0]] = val
+        if not res_df.empty:
+            for _, r in res_df.iterrows():
+                t_s = r['教員'].split(', ')
+                val = format_cell_text(r['クラス'], r['教科'])
+                for t in t_s:
+                    target_col = [c for c in view_cols if c.startswith(t + " ")]
+                    if target_col:
+                        mask = (df_view['曜日']==r['曜日']) & (df_view['限']==r['限'])
+                        df_view.loc[mask, target_col[0]] = val
         
-        # 固定埋め込み (展開対応)
         for _, cr in df_const.iterrows():
-            t_target = cr['対象（教員名orクラス）']
-            targets = expand_targets(t_target, df_teacher) # ここで展開
-            
+            t = cr['対象（教員名orクラス）']
+            targets = expand_targets(t, df_teacher)
             for t_real in targets:
                 target_col = [c for c in view_cols if c.startswith(t_real + " ")]
                 if target_col:
